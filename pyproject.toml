@@ -1,0 +1,9 @@
+[project]
+name = "cpsc416-student-repo"
+version = "0.0.0"
+description = "CPSC 416 student repository tooling (evidence ledger helpers)."
+readme = "README.md"
+requires-python = ">=3.14,<3.15"
+dependencies = [
+    "pydantic>=2.12.5",
+]

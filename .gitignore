@@ -1,0 +1,24 @@
+.DS_Store
+.idea/
+.vscode/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# LaTeX build artifacts (if you store slides/specs here)
+*.aux
+*.log
+*.nav
+*.out
+*.snm
+*.toc
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.pdf
+
+# ignore uv build artifacts
+.venv/
+uv.lock
+

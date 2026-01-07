@@ -1,0 +1,4 @@
+# Put your capstone team repo URL here (one line) once your team is formed.
+# Example:
+# https://github.example.ubc.ca/CPSC416W25T2/team-07-capstone
+
