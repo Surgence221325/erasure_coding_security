@@ -31,3 +31,13 @@ Key Output: Understanding of 3PC commit advantage, and assumptions.
 Decision: N/A
 Evidence Link: this commit
 Unknowns: N/A
+
+Goal: Design project 1 discussion. Specifically discussions about protocol surrounding availability and avoiding constant ViewServer pings.
+Prompt Summary:  One concern I had regarding the new design is that what if both the primary and backup views are stale so we mistakenly return
+a positive response to a client? How can we manage perfect information in this system, or a consistency between the primary and backup when we don't know
+we are wrong and the client doesn't know either.
+Key Output: As long as the primary and backup are consistent this is not a concern. In the worst case we will have to retry the operation. It will not corrupt
+our log.
+Decision: Did not need to include ViewServer interaction in every single request.
+Evidence Link: this commit (check new DP1 PDF)
+Unknowns: Not sure how to prove this, although it seems intuitively right.
