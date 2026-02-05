@@ -16,7 +16,6 @@ __pycache__/
 *.fls
 *.fdb_latexmk
 *.synctex.gz
-*.pdf
 
 # ignore uv build artifacts
 .venv/
