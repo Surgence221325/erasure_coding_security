@@ -1,11 +1,13 @@
 package dslabs.primarybackup;
 
+import dslabs.atmostonce.AMOApplication;
+import dslabs.atmostonce.AMOCommand;
+import dslabs.atmostonce.AMOResult;
 import dslabs.framework.Message;
+import dslabs.framework.Result;
 import lombok.Data;
+import lombok.NonNull;
 
-/* -------------------------------------------------------------------------
-    ViewServer Messages
-   -----------------------------------------------------------------------*/
 @Data
 class Ping implements Message {
     private final int viewNum;
@@ -17,40 +19,41 @@ class GetView implements Message {
 
 @Data
 class ViewReply implements Message {
-    private final View view;
+    @NonNull private final View view;
 }
 
-/* -------------------------------------------------------------------------
-    Primary-Backup Messages
-   -----------------------------------------------------------------------*/
+/* ---------------- PB messages ---------------- */
+
 @Data
 class Request implements Message {
-    // TODO: client request ...
+    @NonNull private final AMOCommand command;
 }
 
 @Data
 class Reply implements Message {
-    //TODO: server response ...
+    @NonNull private final Result result;
 }
 
 @Data
-class BackupRequest implements Message {
-    // TODO: primary send backup request to backup ...
+class ForwardRequest implements Message {
+    @NonNull private final AMOCommand command;
+    @NonNull private final View view;
 }
 
 @Data
-class BackupReply implements Message {
-    // TODO: backup send reply to primary ...
+class ForwardReply implements Message {
+    @NonNull private final PBServer.PBResult result;
+    private final AMOResult amoResult; // nullable: only set on BackupSuccess
+    @NonNull private final View view;
 }
 
 @Data
-class SyncRequest implements Message {
-    // TODO: primary sync up with backup ...
+class StateTransfer implements Message {
+    @NonNull private final AMOApplication<?> app;
+    @NonNull private final View view;
 }
 
 @Data
-class SyncReply implements Message {
-    // TODO: backup send reply to primary ...
+class StateTransferAck implements Message {
+    @NonNull private final View view;
 }
-
-// TODO: add more messages here ...

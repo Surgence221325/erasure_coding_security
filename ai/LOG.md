@@ -41,3 +41,10 @@ our log.
 Decision: Did not need to include ViewServer interaction in every single request.
 Evidence Link: this commit (check new DP1 PDF)
 Unknowns: Not sure how to prove this, although it seems intuitively right.
+
+Goal: Implement DP1
+Prompt Summary: I gave the AI (ChatGPT) context on the problem, and my design choices. I then gave it rough pseudocode
+and asked it to implement the pseudocode into actual Java code. On errors I helped it parse the actual issue and help me iterate.
+Key Output: Somewhat functioning DP1 assignment
+Decision: Included its suggestions, but it made debugging way harder and made it so I was unable to complete it 100% (one error).
+Unknowns: How to fix client desync in DP1.
