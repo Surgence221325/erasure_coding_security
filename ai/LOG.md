@@ -48,3 +48,9 @@ and asked it to implement the pseudocode into actual Java code. On errors I help
 Key Output: Somewhat functioning DP1 assignment
 Decision: Included its suggestions, but it made debugging way harder and made it so I was unable to complete it 100% (one error).
 Unknowns: How to fix client desync in DP1.
+
+Goal: Implement DP2
+Prompt Summary: I gave the AI (ChatGPT) context on the problem, and my design choices. This time I was much more iterative. Generally,
+I would ask the AI to help me "plan" out my tasks at a high level. And then iteratively work through them line by line.
+Decision: Debugging was a lot easier this time, but I still noticed some level of hallucination and some inefficiency I didn't originally consider.
+Unknowns: How to fix time out errors.
