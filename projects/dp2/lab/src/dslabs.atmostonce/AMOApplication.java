@@ -3,6 +3,8 @@ package dslabs.atmostonce;
 import dslabs.framework.Application;
 import dslabs.framework.Command;
 import dslabs.framework.Result;
+import java.util.HashMap;
+import java.util.Map;
 import lombok.EqualsAndHashCode;
 import lombok.Getter;
 import lombok.NonNull;
@@ -16,7 +18,9 @@ public final class AMOApplication<T extends Application>
         implements Application {
     @Getter @NonNull private final T application;
 
-    // Your code here...
+    // Per-client latest executed request/result
+    private final Map<dslabs.framework.Address, Integer> lastSeq = new HashMap<>();
+    private final Map<dslabs.framework.Address, AMOResult> lastResult = new HashMap<>();
 
     @Override
     public AMOResult execute(Command command) {
@@ -26,8 +30,17 @@ public final class AMOApplication<T extends Application>
 
         AMOCommand amoCommand = (AMOCommand) command;
 
-        // Your code here...
-        return null;
+        if (alreadyExecuted(amoCommand)) {
+            return lastResult.get(amoCommand.clientAddress());
+        }
+
+        Result res = application.execute(amoCommand.command());
+        AMOResult amoRes = new AMOResult(res, amoCommand.sequenceNum());
+
+        lastSeq.put(amoCommand.clientAddress(), amoCommand.sequenceNum());
+        lastResult.put(amoCommand.clientAddress(), amoRes);
+
+        return amoRes;
     }
 
     public Result executeReadOnly(Command command) {
@@ -43,7 +56,7 @@ public final class AMOApplication<T extends Application>
     }
 
     public boolean alreadyExecuted(AMOCommand amoCommand) {
-        // Your code here...
-        return false;
+        Integer seen = lastSeq.get(amoCommand.clientAddress());
+        return seen != null && amoCommand.sequenceNum() <= seen;
     }
 }
