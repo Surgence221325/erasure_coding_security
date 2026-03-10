@@ -1,0 +1,38 @@
+# Project build files
+build/
+deps/
+
+
+# IntelliJ
+.out-idea/
+.idea/workspace.xml
+.idea/tasks.xml
+.idea/dictionaries/
+.idea/copyright/
+lab/.idea/
+
+
+# Python
+*.pyc
+
+
+# Common OS/Editor files
+*~
+._*
+
+.DS_Store
+.DS_Store?
+
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+
+# Vim files
+*.swp
+
+
+# Gradle
+.gradle/
+# submission check
+submission_check.txt
