@@ -66,7 +66,6 @@ import static org.junit.Assert.fail;
 
 
 @Lab("4")
-@Part(1)
 public class PaxosTest extends BaseJUnitTest {
     static StateGeneratorBuilder builder(Address[] servers) {
         final StateGeneratorBuilder builder = StateGenerator.builder();

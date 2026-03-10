@@ -1,11 +1,13 @@
 package dslabs.testsuites;
 
+import dslabs.framework.testing.junit.Lab;
 import org.junit.FixMethodOrder;
 import org.junit.runner.RunWith;
 import org.junit.runners.MethodSorters;
 import org.junit.runners.Suite;
 import org.junit.runners.Suite.SuiteClasses;
 
+@Lab("4")
 @RunWith(Suite.class)
 @SuiteClasses({Lab4Part1TestSuite.class})
 @FixMethodOrder(MethodSorters.NAME_ASCENDING)

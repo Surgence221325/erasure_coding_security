@@ -14,6 +14,7 @@ import java.util.Map;
 import java.util.Set;
 import lombok.EqualsAndHashCode;
 import lombok.ToString;
+import java.io.Serializable;
 
 
 @ToString(callSuper = true)
@@ -46,7 +47,7 @@ public class PaxosServer extends Node {
 
     // phase 2 ie. central work, leader proposes for a particular slot and when it gets a majority it
     // marks that slot as decided
-    private final Map<Integer, Set<Address>> p2bResponders = new HashMap<>();
+    private final Map<Integer, Phase2State> p2bResponders = new HashMap<>();
 
     //catchup/gc related fields
     // when we reach two, this server should propose
@@ -59,13 +60,24 @@ public class PaxosServer extends Node {
     private int lastNonEmpty;
 
 
-    private static final class LogEntry {
+    private static final class LogEntry implements Serializable {
+        private static final long serialVersionUID = 1L;
+
         Ballot acceptedBallot;
         PaxosRequest acceptedValue;
         boolean chosen;
         PaxosRequest chosenValue;
     }
-    public static final class NoOp implements Command {
+
+    public static final class NoOp implements Command, Serializable {
+        private static final long serialVersionUID = 1L;
+    }
+
+    private static final class Phase2State implements Serializable {
+        int slot;
+        Ballot ballot;
+        PaxosRequest value;
+        Set<Address> responders = new HashSet<>();
     }
 
     // Your code here...
@@ -175,11 +187,10 @@ public class PaxosServer extends Node {
 
         LogEntry entry = log.get(logSlotNum);
         PaxosRequest req = entry.chosen ? entry.chosenValue : entry.acceptedValue;
-        // defensive check here, but can potentially be omitted as this should never happen?
-        // currently commenting it out since I want to see the error if it does happen
-        // if (req == null) {
-        //     return null;
-        // }
+
+        if (req == null || isNoOp(req)) {
+            return null;
+        }
 
         AMOCommand amo = req.command();
         return amo.command();
@@ -284,13 +295,14 @@ public class PaxosServer extends Node {
 
     private void startPhase1() {
         isActive = false;
-        knownLeader = null;
+        // knownLeader = null;
 
         myBallot = new Ballot(myBallot.sequenceNum() + 1, address());
 
         p1bResponders.clear();
         p2bResponders.clear();
         adopted.clear();
+        proposals.clear();
 
         // count self immediately
         p1bResponders.add(address());
@@ -312,14 +324,34 @@ public class PaxosServer extends Node {
     // Phase 2/Proposal
 
     private void handlePaxosRequest(PaxosRequest m, Address sender) {
-        if (!isActive) {
+        if (isActive) {
+            Integer existingSlot = existingProposalSlot(m);
+            if (existingSlot != null) {
+                LogEntry entry = log.get(existingSlot);
+
+                if (entry != null && entry.chosen) {
+                    return;
+                }
+
+                Phase2State st = p2bResponders.get(existingSlot);
+                if (st != null && st.ballot.equals(myBallot)) {
+                    resendP2A(existingSlot);
+                    return;
+                }
+
+                proposals.remove(existingSlot);
+            }
+
+            int slot = nextProposalSlot();
+            proposals.put(slot, m);
+            slotIn = Math.max(slotIn, slot + 1);
+            sendP2A(slot, m);
             return;
         }
 
-        int slot = nextProposalSlot();
-        proposals.put(slot, m);
-        slotIn = Math.max(slotIn, slot + 1);
-        sendP2A(slot, m);
+        if (knownLeader != null && !knownLeader.equals(address())) {
+            send(m, knownLeader);
+        }
     }
 
     private void handleP2A(P2A m, Address sender) {
@@ -340,9 +372,30 @@ public class PaxosServer extends Node {
             myBallot = incoming;
             isActive = false;
             knownLeader = sender;
+            p1bResponders.clear();
+            adopted.clear();
+            p2bResponders.clear();
+            proposals.clear();
         }
 
         LogEntry entry = ensureLogEntry(slot);
+
+        // already chosen: only ack if same chosen value
+        if (entry.chosen) {
+            boolean sameChosen = sameRequest(entry.chosenValue, m.value());
+            send(new P2B(myBallot, slot, sameChosen), sender);
+            return;
+        }
+
+        // do not allow same ballot + same slot to switch to a different value
+        if (entry.acceptedBallot != null
+            && entry.acceptedBallot.equals(incoming)
+            && entry.acceptedValue != null
+            && !sameRequest(entry.acceptedValue, m.value())) {
+            send(new P2B(myBallot, slot, false), sender);
+            return;
+        }
+
         entry.acceptedBallot = incoming;
         entry.acceptedValue = m.value();
         lastNonEmpty = Math.max(lastNonEmpty, slot);
@@ -372,19 +425,33 @@ public class PaxosServer extends Node {
             return;
         }
 
-        p2bResponders.putIfAbsent(slot, new HashSet<>());
-        p2bResponders.get(slot).add(sender);
-
-        if (p2bResponders.get(slot).size() < majority()) {
+        Phase2State st = p2bResponders.get(slot);
+        if (st == null) {
             return;
         }
 
-        PaxosRequest value = proposals.get(slot);
-        if (value == null) {
+        // only count replies for the exact current in-flight proposal
+        if (!st.ballot.equals(myBallot)) {
             return;
         }
 
-        chooseSlotLocally(slot, value);
+        LogEntry entry = log.get(slot);
+        if (entry == null || entry.chosen) {
+            return;
+        }
+
+        // make sure the slot still corresponds to the same value
+        if (!sameRequest(st.value, entry.acceptedValue)) {
+            return;
+        }
+
+        st.responders.add(sender);
+
+        if (st.responders.size() < majority()) {
+            return;
+        }
+
+        chooseSlotLocally(slot, st.value);
     }
 
 
@@ -407,7 +474,8 @@ public class PaxosServer extends Node {
 
     private void onHeartbeatTimer(HeartbeatTimer t) {
         if (isActive) {
-            // retry any still-unresolved proposals
+            followerSlotOut.put(address(), slotOut);
+
             for (Map.Entry<Integer, PaxosRequest> e : proposals.entrySet()) {
                 int slot = e.getKey();
                 PaxosRequest value = e.getValue();
@@ -418,6 +486,16 @@ public class PaxosServer extends Node {
 
                 LogEntry entry = log.get(slot);
                 if (entry != null && entry.chosen) {
+                    continue;
+                }
+
+                Phase2State st = p2bResponders.get(slot);
+                if (st == null) {
+                    continue;
+                }
+
+                // Only retry if this exact proposal is still the active one.
+                if (!st.ballot.equals(myBallot) || !sameRequest(st.value, value)) {
                     continue;
                 }
 
@@ -473,6 +551,8 @@ public class PaxosServer extends Node {
         isActive = true;
         knownLeader = address();
         missedHeartbeats = 0;
+        followerSlotOut.put(address(), slotOut);
+        p2bResponders.clear();
 
         int maxSeen = slotOut - 1;
         for (int slot : adopted.keySet()) {
@@ -496,12 +576,12 @@ public class PaxosServer extends Node {
         }
 
         slotIn = Math.max(slotIn, maxSeen + 1);
-
         set(new HeartbeatTimer(), HeartbeatTimer.HEARTBEAT_MILLIS);
     }
 
     private void chooseSlotLocally(int slot, PaxosRequest value) {
         LogEntry entry = ensureLogEntry(slot);
+
         if (entry.chosen) {
             return;
         }
@@ -514,19 +594,36 @@ public class PaxosServer extends Node {
 
         Decision d = new Decision(slot, value);
         broadcast(d);
+
+        // clear proposal bookkeeping now that it's decided
+        proposals.remove(slot);
+        p2bResponders.remove(slot);
+
         handleDecision(d, address());
     }
 
     private void sendP2A(int slot, PaxosRequest value) {
         LogEntry entry = ensureLogEntry(slot);
+
+        if (entry.chosen) {
+            return;
+        }
+
+        proposals.put(slot, value);
+
         entry.acceptedBallot = myBallot;
         entry.acceptedValue = value;
-
-        p2bResponders.putIfAbsent(slot, new HashSet<>());
-        p2bResponders.get(slot).add(address()); // self counts as a vote
         lastNonEmpty = Math.max(lastNonEmpty, slot);
 
-        if (p2bResponders.get(slot).size() >= majority()) {
+        // fresh phase-2 state for this exact proposal
+        Phase2State st = new Phase2State();
+        st.slot = slot;
+        st.ballot = myBallot;
+        st.value = value;
+        st.responders.add(address()); // self vote
+        p2bResponders.put(slot, st);
+
+        if (st.responders.size() >= majority()) {
             chooseSlotLocally(slot, value);
             return;
         }
@@ -542,16 +639,26 @@ public class PaxosServer extends Node {
         }
 
         LogEntry entry = ensureLogEntry(slot);
-        entry.chosen = true;
-        entry.chosenValue = m.value();
 
-        // Keep acceptedValue aligned with chosen value if you want,
-        // but do NOT overwrite acceptedBallot with local myBallot.
-        if (entry.acceptedValue == null) {
-            entry.acceptedValue = m.value();
+        // Never allow a chosen slot to be overwritten with a different value.
+        if (entry.chosen) {
+            if (!sameRequest(entry.chosenValue, m.value())) {
+                return;
+            }
+            executeChosen();
+            return;
         }
 
+        // If we had previously accepted something different locally, do not
+        // overwrite accepted state blindly; chosen value is now authoritative.
+        entry.chosen = true;
+        entry.chosenValue = m.value();
+        entry.acceptedValue = m.value();
         lastNonEmpty = Math.max(lastNonEmpty, slot);
+
+        // This slot is no longer "in flight" from the leader's perspective.
+        proposals.remove(slot);
+        p2bResponders.remove(slot);
 
         executeChosen();
     }
@@ -602,14 +709,22 @@ public class PaxosServer extends Node {
 
         followerSlotOut.put(sender, m.slotOut());
 
+        // Keep leader's own executed frontier up to date too.
+        followerSlotOut.put(address(), slotOut);
+
         sendMissingChosenSlots(sender, m.slotOut());
 
-        int gcUpTo = slotOut;
+        // Since slotOut is the next slot to execute, the new firstNonCleared
+        // should be min(all slotOuts).
+        int newFirstNonCleared = slotOut;
         for (Address s : servers) {
-            gcUpTo = Math.min(gcUpTo, followerSlotOut.getOrDefault(s, 1));
+            newFirstNonCleared = Math.min(
+                newFirstNonCleared,
+                followerSlotOut.getOrDefault(s, 1)
+            );
         }
 
-        applyGc(gcUpTo);
+        applyGc(newFirstNonCleared);
     }
 
     private void sendMissingChosenSlots(Address follower, int followerNextSlot) {
@@ -628,10 +743,15 @@ public class PaxosServer extends Node {
                 return;
             }
 
-            AMOCommand amoCommand = entry.chosenValue.command();
-            AMOResult result = app.execute(amoCommand);
+            PaxosRequest req = entry.chosenValue;
 
-            send(new PaxosReply(result), amoCommand.clientAddress());;
+            // No-op fills holes in the log but must not be executed on KVStore
+            // or replied to as a client command.
+            if (!isNoOp(req)) {
+                AMOCommand amoCommand = req.command();
+                AMOResult result = app.execute(amoCommand);
+                send(new PaxosReply(result), amoCommand.clientAddress());
+            }
 
             slotOut++;
         }
@@ -672,17 +792,77 @@ public class PaxosServer extends Node {
     }
 
     private void recomputeLastNonEmpty() {
-        int max = 0;
+        int max = firstNonCleared - 1;
+
         for (int slot : log.keySet()) {
             if (slot >= firstNonCleared) {
                 max = Math.max(max, slot);
             }
         }
+
         lastNonEmpty = max;
     }
 
     private PaxosRequest makeNoOpRequest() {
         AMOCommand amo = new AMOCommand(new NoOp(), address(), -1);
         return new PaxosRequest(amo);
+    }
+
+    private boolean isNoOp(PaxosRequest req) {
+        if (req == null || req.command() == null) {
+            return false;
+        }
+        return req.command().command() instanceof NoOp;
+    }
+
+    private boolean sameRequest(PaxosRequest a, PaxosRequest b) {
+        if (a == b) {
+            return true;
+        }
+        if (a == null || b == null) {
+            return false;
+        }
+        return a.equals(b);
+    }
+
+    private Integer existingProposalSlot(PaxosRequest req) {
+        for (Map.Entry<Integer, PaxosRequest> e : proposals.entrySet()) {
+            if (sameRequest(e.getValue(), req)) {
+                return e.getKey();
+            }
+        }
+
+        for (Map.Entry<Integer, LogEntry> e : log.entrySet()) {
+            int slot = e.getKey();
+            LogEntry entry = e.getValue();
+
+            if (slot < firstNonCleared) {
+                continue;
+            }
+
+            if (entry == null) {
+                continue;
+            }
+
+            if (sameRequest(entry.chosenValue, req) || sameRequest(entry.acceptedValue, req)) {
+                return slot;
+            }
+        }
+
+        return null;
+    }
+
+    private void resendP2A(int slot) {
+        Phase2State st = p2bResponders.get(slot);
+        LogEntry entry = log.get(slot);
+
+        if (!isActive || st == null || entry == null || entry.chosen) {
+            return;
+        }
+        if (!st.ballot.equals(myBallot)) {
+            return;
+        }
+
+        broadcast(new P2A(myBallot, slot, st.value));
     }
 }

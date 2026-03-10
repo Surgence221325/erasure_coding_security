@@ -21,7 +21,6 @@ import static dslabs.kvstore.KVStoreWorkload.putOk;
 import static org.junit.Assert.assertEquals;
 
 @Lab("2")
-@Part(1)
 @RunWith(DSLabsTestRunner.class)
 public class KVStoreTest extends DSLabsJUnitTest {
     private KVStore kvStore;

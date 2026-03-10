@@ -11,7 +11,7 @@ import java.util.List;
 import static dslabs.paxos.PaxosTest.builder;
 
 @Lab("4")
-public class PaxosVizConfig extends VizConfig {
+public abstract class PaxosVizConfig extends VizConfig {
     @Override
     protected StateGenerator stateGenerator(List<Address> servers,
                                             List<Address> clients,
