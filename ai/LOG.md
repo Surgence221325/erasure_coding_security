@@ -54,3 +54,8 @@ Prompt Summary: I gave the AI (ChatGPT) context on the problem, and my design ch
 I would ask the AI to help me "plan" out my tasks at a high level. And then iteratively work through them line by line.
 Decision: Debugging was a lot easier this time, but I still noticed some level of hallucination and some inefficiency I didn't originally consider.
 Unknowns: How to fix time out errors.
+
+Goal: Capstone Design
+Prompt Summary: I was given an idea by the Professor on how to "spice up" a distributed key value store. I chose to use erasure coding to ensure confidentiality of stored objects. ChatGPT was helpful in iteratively helping me make decisions about the design and understand intricacies regarding this concept I was unaware of.
+Decision: (k, m) erasure coding scheme, and key-share threshold encryption as core of distributed decision
+Unknowns: alternatives to this scheme? any ways to improve latency/tradeoffs.
