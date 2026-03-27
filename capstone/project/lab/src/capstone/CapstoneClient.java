@@ -116,7 +116,7 @@ public final class CapstoneClient extends Node implements Client {
     private synchronized void handleAuthChallenge(AuthChallenge challenge, Address sender) {
         if (authenticated) return;
         log("Received auth challenge, computing HMAC");
-        byte[] hmac = hmacSha256(sharedSecret, challenge.nonce());
+        byte[] hmac = CryptoUtil.hmacSha256(sharedSecret, challenge.nonce());
         send(new AuthResponse(address().toString(), hmac), coordinator);
     }
 
@@ -205,10 +205,6 @@ public final class CapstoneClient extends Node implements Client {
         } else {
             throw new IllegalArgumentException("Unknown command type: " + pendingCommand);
         }
-    }
-
-    private static byte[] hmacSha256(byte[] key, byte[] data) {
-        return CryptoUtil.hmacSha256(key, data);
     }
 
     private void log(String msg) {

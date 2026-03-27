@@ -242,7 +242,7 @@ public class CoordinatorNode extends Node {
         }
 
         byte[] secret = clientSecrets.get(resp.clientId());
-        byte[] expected = hmacSha256(secret, nonce);
+        byte[] expected = CryptoUtil.hmacSha256(secret, nonce);
 
         if (!Arrays.equals(expected, resp.hmac())) {
             log("Auth FAILED for " + resp.clientId() + " — HMAC mismatch");
@@ -286,6 +286,33 @@ public class CoordinatorNode extends Node {
         return clientToToken.get(clientId);
     }
 
+    /**
+     * Validate authentication and authorization for a request.
+     * Returns the authenticated clientId on success, or null if rejected
+     * (in which case the error string is set in errorOut[0]).
+     */
+    private String validateAndAuthorize(String clientId, String sessionToken, String key,
+                                        String[] errorOut) {
+        String authClient = validateSession(sessionToken);
+        if (authClient == null) {
+            log("Rejected: no valid session for " + clientId);
+            errorOut[0] = "AUTH_REQUIRED";
+            return null;
+        }
+        if (!authClient.equals(clientId)) {
+            log("Rejected: session/clientId mismatch for " + clientId);
+            errorOut[0] = "IDENTITY_MISMATCH";
+            return null;
+        }
+        String owner = keyOwner.get(key);
+        if (owner != null && !owner.equals(authClient)) {
+            log("Rejected: " + authClient + " is not owner of key=" + key);
+            errorOut[0] = "ACCESS_DENIED";
+            return null;
+        }
+        return authClient;
+    }
+
     // =========================================================================
     //  Region liveness
     // =========================================================================
@@ -317,24 +344,11 @@ public class CoordinatorNode extends Node {
         log("WriteRequest from " + req.clientId() + " seq=" + req.sequenceNum()
             + " key=" + req.key() + " token=" + (req.sessionToken() != null ? "present" : "MISSING"));
 
-        // --- Session authentication check ---
-        String authClient = validateSession(req.sessionToken());
+        // --- Authentication + authorization ---
+        String[] errorOut = new String[1];
+        String authClient = validateAndAuthorize(req.clientId(), req.sessionToken(), req.key(), errorOut);
         if (authClient == null) {
-            log("Rejected: no valid session for " + req.clientId());
-            send(new WriteResponse(req.clientId(), req.sequenceNum(), false, "AUTH_REQUIRED"), sender);
-            return;
-        }
-        if (!authClient.equals(req.clientId())) {
-            log("Rejected: session/clientId mismatch for " + req.clientId());
-            send(new WriteResponse(req.clientId(), req.sequenceNum(), false, "IDENTITY_MISMATCH"), sender);
-            return;
-        }
-
-        // --- Per-key ownership check ---
-        String owner = keyOwner.get(req.key());
-        if (owner != null && !owner.equals(authClient)) {
-            log("Rejected: " + authClient + " is not owner of key=" + req.key());
-            send(new WriteResponse(req.clientId(), req.sequenceNum(), false, "ACCESS_DENIED"), sender);
+            send(new WriteResponse(req.clientId(), req.sequenceNum(), false, errorOut[0]), sender);
             return;
         }
 
@@ -514,24 +528,11 @@ public class CoordinatorNode extends Node {
         log("ReadRequest from " + req.clientId() + " seq=" + req.sequenceNum()
             + " key=" + req.key() + " token=" + (req.sessionToken() != null ? "present" : "MISSING"));
 
-        // --- Session authentication check ---
-        String authClient = validateSession(req.sessionToken());
+        // --- Authentication + authorization ---
+        String[] errorOut = new String[1];
+        String authClient = validateAndAuthorize(req.clientId(), req.sessionToken(), req.key(), errorOut);
         if (authClient == null) {
-            log("Rejected: no valid session for " + req.clientId());
-            send(new ReadResponse(req.clientId(), req.sequenceNum(), null, "AUTH_REQUIRED"), sender);
-            return;
-        }
-        if (!authClient.equals(req.clientId())) {
-            log("Rejected: session/clientId mismatch for " + req.clientId());
-            send(new ReadResponse(req.clientId(), req.sequenceNum(), null, "IDENTITY_MISMATCH"), sender);
-            return;
-        }
-
-        // --- Per-key ownership check ---
-        String owner = keyOwner.get(req.key());
-        if (owner != null && !owner.equals(authClient)) {
-            log("Rejected: " + authClient + " is not owner of key=" + req.key());
-            send(new ReadResponse(req.clientId(), req.sequenceNum(), null, "ACCESS_DENIED"), sender);
+            send(new ReadResponse(req.clientId(), req.sequenceNum(), null, errorOut[0]), sender);
             return;
         }
 
@@ -740,7 +741,7 @@ public class CoordinatorNode extends Node {
             return;
         }
 
-        byte[] expected = hmacSha256(clusterSecret, sender.toString().getBytes());
+        byte[] expected = CryptoUtil.hmacSha256(clusterSecret, sender.toString().getBytes());
         if (!Arrays.equals(expected, req.hmac())) {
             log("Rejected join: HMAC mismatch from " + sender);
             send(new JoinResult(false, "AUTH_FAILED"), sender);
@@ -869,10 +870,6 @@ public class CoordinatorNode extends Node {
             c.init(Cipher.DECRYPT_MODE, new SecretKeySpec(key, "AES"), new IvParameterSpec(iv));
             return c.doFinal(data);
         } catch (Exception e) { throw new RuntimeException("AES decrypt failed", e); }
-    }
-
-    private static byte[] hmacSha256(byte[] key, byte[] data) {
-        return CryptoUtil.hmacSha256(key, data);
     }
 
     // =========================================================================

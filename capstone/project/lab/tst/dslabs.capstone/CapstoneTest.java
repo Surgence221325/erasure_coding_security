@@ -1064,7 +1064,15 @@ public class CapstoneTest extends BaseJUnitTest {
             + ", per operation: " + String.format("%.1f", msgsPerOp)
             + " (expected ~14)");
 
+        // Expected: ~14 msgs/op. Lower bound ensures the system actually sends
+        // messages (a broken system sending 0 would otherwise pass). Upper bound
+        // catches excessive retransmissions or protocol bloat.
+        int minExpected = 10;
         int maxAllowed = 20;
+        if (msgsPerOp < minExpected) {
+            fail("Too few messages per operation: " + msgsPerOp
+                + ", minimum " + minExpected + " (system may not be sending correctly)");
+        }
         if (msgsPerOp > maxAllowed) {
             fail("Too many messages per operation: " + msgsPerOp
                 + ", allowed " + maxAllowed);

@@ -65,14 +65,10 @@ public class RegionalNode extends Node {
 
         // If configured for dynamic join, send JoinRequest to coordinator
         if (coordinatorAddress != null && clusterSecret != null) {
-            byte[] hmac = hmacSha256(clusterSecret, address().toString().getBytes());
+            byte[] hmac = CryptoUtil.hmacSha256(clusterSecret, address().toString().getBytes());
             send(new JoinRequest(hmac), coordinatorAddress);
             log("Sent JoinRequest to " + coordinatorAddress);
         }
-    }
-
-    private static byte[] hmacSha256(byte[] key, byte[] data) {
-        return CryptoUtil.hmacSha256(key, data);
     }
 
     // -------------------------------------------------------------------------
