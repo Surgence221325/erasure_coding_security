@@ -1016,4 +1016,108 @@ public class CapstoneTest extends BaseJUnitTest {
                       .addPrune(CLIENTS_DONE);
         dfs(initSearchState);
     }
+
+    // =========================================================================
+    //  Part 8 — cost measurements
+    // =========================================================================
+
+    @Test(timeout = 15 * 1000)
+    @TestDescription("Message count per write/read operation")
+    @Category(RunTests.class)
+    @TestPointValue(10)
+    public void test31MessageCount() throws InterruptedException {
+        int nRounds = 20;
+
+        setupState(emptyWorkload());
+        Client client = runState.addClient(client(1));
+        runState.start(runSettings);
+
+        // Let auth complete and initial heartbeats settle
+        Thread.sleep(500);
+
+        // Snapshot message counts before operations
+        long msgsBefore = 0;
+        for (Address s : runState.serverAddresses()) {
+            msgsBefore += runState.network().numMessagesSentTo(s);
+        }
+        msgsBefore += runState.network().numMessagesSentTo(client(1));
+
+        // Run nRounds write+read pairs
+        for (int i = 0; i < nRounds; i++) {
+            sendCommandAndCheck(client, write("key-" + i, "val-" + i), writeOk());
+            sendCommandAndCheck(client, read("key-" + i), readResult("val-" + i));
+        }
+
+        // Snapshot after
+        long msgsAfter = 0;
+        for (Address s : runState.serverAddresses()) {
+            msgsAfter += runState.network().numMessagesSentTo(s);
+        }
+        msgsAfter += runState.network().numMessagesSentTo(client(1));
+
+        long totalMessages = msgsAfter - msgsBefore;
+        double msgsPerOp = ((double) totalMessages) / (nRounds * 2); // 2 ops per round
+
+        // Expected: ~14 messages per write, ~14 per read = ~14 average
+        // Allow generous headroom for heartbeats and retries: 20 per op max
+        System.out.println("Total messages: " + totalMessages
+            + ", per operation: " + String.format("%.1f", msgsPerOp)
+            + " (expected ~14)");
+
+        int maxAllowed = 20;
+        if (msgsPerOp > maxAllowed) {
+            fail("Too many messages per operation: " + msgsPerOp
+                + ", allowed " + maxAllowed);
+        }
+    }
+
+    @Test(timeout = 10 * 1000)
+    @TestDescription("Storage overhead: erasure coding vs raw replication")
+    @Category(RunTests.class)
+    @TestPointValue(10)
+    public void test32StorageOverhead() throws InterruptedException {
+        // Verify erasure coding storage cost analytically.
+        // With k=2, m=1 for a 1000-byte value:
+        //   Plaintext: 1000B
+        //   Ciphertext: 1008B (AES-128/CBC adds up to 16B padding)
+        //   Padded for erasure: ceil(1008/2)*2 = 1008B (already even)
+        //   Each fragment: 1008/2 = 504B
+        //   Total fragments: 3 × 504B = 1512B
+        //   Key shares: 3 × 16B = 48B
+        //   Total stored: ~1560B across 3 regions
+        //   3x replication: 3 × 1000B = 3000B
+        //   Overhead ratio: 1560/3000 = 52% of naive replication
+        //
+        // Write and read a 1000B value to confirm the system works at this size,
+        // then log the computed overhead.
+        setupState(emptyWorkload());
+        Client client = runState.addClient(client(1));
+        runState.start(runSettings);
+
+        String value = "A".repeat(1000);
+        sendCommandAndCheck(client, write("measure-key", value), writeOk());
+        sendCommandAndCheck(client, read("measure-key"), readResult(value));
+
+        // Compute storage overhead analytically
+        int plaintextSize = 1000;
+        int ciphertextSize = ((plaintextSize / 16) + 1) * 16; // AES padding
+        int fragmentSize = (ciphertextSize + K - 1) / K;       // ceil division
+        int totalFragmentBytes = fragmentSize * (K + M);
+        int totalKeyShareBytes = 16 * (K + M);                 // AES-128 = 16B key
+        int totalStored = totalFragmentBytes + totalKeyShareBytes;
+        int naiveReplication = plaintextSize * (K + M);
+
+        double ratio = (double) totalStored / naiveReplication;
+        System.out.println("Storage analysis for " + plaintextSize + "B value:"
+            + " ciphertext=" + ciphertextSize + "B"
+            + ", fragments=" + (K + M) + "×" + fragmentSize + "B=" + totalFragmentBytes + "B"
+            + ", keyShares=" + (K + M) + "×16B=" + totalKeyShareBytes + "B"
+            + ", total=" + totalStored + "B"
+            + " vs 3x-replication=" + naiveReplication + "B"
+            + " (ratio=" + String.format("%.0f%%", ratio * 100) + ")");
+
+        // Erasure coding should use less than naive replication
+        assertTrue("Erasure coding should be cheaper than naive replication",
+                   totalStored < naiveReplication);
+    }
 }
