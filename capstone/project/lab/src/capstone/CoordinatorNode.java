@@ -9,6 +9,7 @@ import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 import javax.crypto.Cipher;
+import javax.crypto.Mac;
 import javax.crypto.spec.IvParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 import lombok.EqualsAndHashCode;
@@ -51,6 +52,23 @@ import lombok.ToString;
  *   - One pending write per key at a time.
  *   - One pending read per key at a time.
  *   - AES key never stored at coordinator — generated, distributed, discarded.
+ *
+ *   AUTHENTICATION
+ *   ---------------
+ *   Clients authenticate via a challenge-response handshake before issuing
+ *   any commands.  The coordinator holds a pre-shared secret per client.
+ *   1. Client sends AuthRequest(clientId).
+ *   2. Coordinator replies with AuthChallenge(nonce) — a random 16-byte nonce.
+ *   3. Client computes HMAC-SHA256(sharedSecret, nonce) and sends AuthResponse.
+ *   4. Coordinator verifies the HMAC, issues a session token on success.
+ *   All subsequent WriteRequest/ReadRequest carry the session token.
+ *   Requests with missing or invalid tokens are rejected with AUTH_REQUIRED.
+ *
+ *   AUTHORIZATION (per-key ownership)
+ *   ----------------------------------
+ *   The first client to successfully commit a write to a key becomes its owner.
+ *   Subsequent writes or reads from a different client are rejected with
+ *   ACCESS_DENIED.  Ownership is permanent (no transfer or revocation).
  */
 @ToString(callSuper = true)
 @EqualsAndHashCode(callSuper = true)
@@ -66,6 +84,9 @@ public class CoordinatorNode extends Node {
 
     // Precomputed erasure coder (stateless, safe to share)
     private final ErasureCoder erasureCoder;
+
+    // --- Authentication secrets (clientId -> pre-shared secret, immutable) ---
+    private final Map<String, byte[]> clientSecrets;
 
     // --- Version metadata ---
     // objectKey -> (versionNum -> VersionMetadata)
@@ -88,13 +109,24 @@ public class CoordinatorNode extends Node {
     // --- Region liveness (region address -> last heartbeat reply time ms) ---
     private Map<Address, Long> lastHeartbeat;
 
-    public CoordinatorNode(Address address, Address[] regions, int k, int m, int keyThreshold) {
+    // --- Authentication state ---
+    // clientId -> nonce (pending challenge-response)
+    private Map<String, byte[]> pendingAuths;
+    // sessionToken -> clientId (validated sessions)
+    private Map<String, String> validSessions;
+
+    // --- Per-key ownership (key -> owning clientId) ---
+    private Map<String, String> keyOwner;
+
+    public CoordinatorNode(Address address, Address[] regions, int k, int m,
+                           int keyThreshold, Map<String, byte[]> clientSecrets) {
         super(address);
         this.regions       = regions;
         this.k             = k;
         this.m             = m;
         this.keyThreshold  = keyThreshold;
         this.erasureCoder  = new ErasureCoder(k, m);
+        this.clientSecrets = clientSecrets;
     }
 
     @Override
@@ -106,6 +138,9 @@ public class CoordinatorNode extends Node {
         pendingReads    = new HashMap<>();
         writeDedup      = new HashMap<>();
         lastHeartbeat   = new HashMap<>();
+        pendingAuths    = new HashMap<>();
+        validSessions   = new HashMap<>();
+        keyOwner        = new HashMap<>();
 
         // Assume all regions alive at startup; they'll confirm via heartbeat.
         long now = System.currentTimeMillis();
@@ -116,11 +151,93 @@ public class CoordinatorNode extends Node {
     }
 
     // =========================================================================
+    //  AUTHENTICATION
+    // =========================================================================
+
+    private void handleAuthRequest(AuthRequest req, Address sender) {
+        log("Auth request from " + req.clientId());
+
+        if (!clientSecrets.containsKey(req.clientId())) {
+            log("Unknown client: " + req.clientId());
+            send(new AuthResultMsg(req.clientId(), null, false, "UNKNOWN_CLIENT"), sender);
+            return;
+        }
+
+        // Generate nonce and send challenge
+        byte[] nonce = new byte[16];
+        RNG.nextBytes(nonce);
+        pendingAuths.put(req.clientId(), nonce);
+        send(new AuthChallenge(req.clientId(), nonce), sender);
+        log("Sent auth challenge to " + req.clientId());
+    }
+
+    private void handleAuthResponse(AuthResponse resp, Address sender) {
+        byte[] nonce = pendingAuths.get(resp.clientId());
+        if (nonce == null) {
+            send(new AuthResultMsg(resp.clientId(), null, false, "NO_PENDING_AUTH"), sender);
+            return;
+        }
+
+        byte[] secret = clientSecrets.get(resp.clientId());
+        byte[] expected = hmacSha256(secret, nonce);
+
+        if (!Arrays.equals(expected, resp.hmac())) {
+            log("Auth FAILED for " + resp.clientId() + " — HMAC mismatch");
+            pendingAuths.remove(resp.clientId());
+            send(new AuthResultMsg(resp.clientId(), null, false, "AUTH_FAILED"), sender);
+            return;
+        }
+
+        // Issue session token
+        byte[] tokenBytes = new byte[16];
+        RNG.nextBytes(tokenBytes);
+        StringBuilder sb = new StringBuilder();
+        for (byte b : tokenBytes) sb.append(String.format("%02x", b & 0xff));
+        String token = sb.toString();
+
+        validSessions.put(token, resp.clientId());
+        pendingAuths.remove(resp.clientId());
+        log("*** Authenticated " + resp.clientId() + " token=" + token + " ***");
+        send(new AuthResultMsg(resp.clientId(), token, true, null), sender);
+    }
+
+    /**
+     * Validate the session token and return the authenticated clientId,
+     * or null if the token is missing or invalid.
+     */
+    private String validateSession(String sessionToken) {
+        if (sessionToken == null) return null;
+        return validSessions.get(sessionToken);
+    }
+
+    // =========================================================================
     //  WRITE PATH
     // =========================================================================
 
     private void handleWriteRequest(WriteRequest req, Address sender) {
-        log("Received " + req);
+        log("WriteRequest from " + req.clientId() + " seq=" + req.sequenceNum()
+            + " key=" + req.key() + " token=" + (req.sessionToken() != null ? "present" : "MISSING"));
+
+        // --- Session authentication check ---
+        String authClient = validateSession(req.sessionToken());
+        if (authClient == null) {
+            log("Rejected: no valid session for " + req.clientId());
+            send(new WriteResponse(req.clientId(), req.sequenceNum(), false, "AUTH_REQUIRED"), sender);
+            return;
+        }
+        if (!authClient.equals(req.clientId())) {
+            log("Rejected: session/clientId mismatch for " + req.clientId());
+            send(new WriteResponse(req.clientId(), req.sequenceNum(), false, "IDENTITY_MISMATCH"), sender);
+            return;
+        }
+
+        // --- Per-key ownership check ---
+        String owner = keyOwner.get(req.key());
+        if (owner != null && !owner.equals(authClient)) {
+            log("Rejected: " + authClient + " is not owner of key=" + req.key());
+            send(new WriteResponse(req.clientId(), req.sequenceNum(), false, "ACCESS_DENIED"), sender);
+            return;
+        }
 
         // --- AMO dedup check ---
         WriteResponse cached = getCachedWriteResponse(req.clientId(), req.sequenceNum());
@@ -222,10 +339,12 @@ public class CoordinatorNode extends Node {
         VersionMetadata meta = allVersions.get(pending.key).get(pending.version);
         meta.committed = true;
         latestCommitted.put(pending.key, pending.version);
+        boolean newOwner = keyOwner.putIfAbsent(pending.key, pending.clientId) == null;
 
         log("*** COMMITTED key=" + pending.key + " v=" + pending.version
             + " (frags=" + pending.fragmentAcks.size() + "/" + k
-            + ", shares=" + pending.keyShareAcks.size() + "/" + keyThreshold + ") ***");
+            + ", shares=" + pending.keyShareAcks.size() + "/" + keyThreshold + ")"
+            + (newOwner ? " owner=" + pending.clientId : "") + " ***");
 
         WriteResponse resp = new WriteResponse(pending.clientId, pending.seqNum, true, null);
         cacheWriteResponse(pending.clientId, pending.seqNum, resp);
@@ -239,7 +358,29 @@ public class CoordinatorNode extends Node {
     // =========================================================================
 
     private void handleReadRequest(ReadRequest req, Address sender) {
-        log("Received " + req);
+        log("ReadRequest from " + req.clientId() + " seq=" + req.sequenceNum()
+            + " key=" + req.key() + " token=" + (req.sessionToken() != null ? "present" : "MISSING"));
+
+        // --- Session authentication check ---
+        String authClient = validateSession(req.sessionToken());
+        if (authClient == null) {
+            log("Rejected: no valid session for " + req.clientId());
+            send(new ReadResponse(req.clientId(), req.sequenceNum(), null, "AUTH_REQUIRED"), sender);
+            return;
+        }
+        if (!authClient.equals(req.clientId())) {
+            log("Rejected: session/clientId mismatch for " + req.clientId());
+            send(new ReadResponse(req.clientId(), req.sequenceNum(), null, "IDENTITY_MISMATCH"), sender);
+            return;
+        }
+
+        // --- Per-key ownership check ---
+        String owner = keyOwner.get(req.key());
+        if (owner != null && !owner.equals(authClient)) {
+            log("Rejected: " + authClient + " is not owner of key=" + req.key());
+            send(new ReadResponse(req.clientId(), req.sequenceNum(), null, "ACCESS_DENIED"), sender);
+            return;
+        }
 
         if (pendingReads.containsKey(req.key())) {
             send(new ReadResponse(req.clientId(), req.sequenceNum(), null, "READ_IN_PROGRESS"), sender);
@@ -430,6 +571,18 @@ public class CoordinatorNode extends Node {
             c.init(Cipher.DECRYPT_MODE, new SecretKeySpec(key, "AES"), new IvParameterSpec(iv));
             return c.doFinal(data);
         } catch (Exception e) { throw new RuntimeException("AES decrypt failed", e); }
+    }
+
+    // =========================================================================
+    //  HMAC-SHA256
+    // =========================================================================
+
+    private static byte[] hmacSha256(byte[] key, byte[] data) {
+        try {
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec(key, "HmacSHA256"));
+            return mac.doFinal(data);
+        } catch (Exception e) { throw new RuntimeException("HMAC failed", e); }
     }
 
     // =========================================================================

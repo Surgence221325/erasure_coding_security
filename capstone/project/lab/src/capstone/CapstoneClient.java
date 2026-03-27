@@ -5,6 +5,8 @@ import dslabs.framework.Client;
 import dslabs.framework.Command;
 import dslabs.framework.Node;
 import dslabs.framework.Result;
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
 import lombok.EqualsAndHashCode;
 import lombok.ToString;
 
@@ -14,29 +16,26 @@ import lombok.ToString;
  * Extends dslabs.framework.Node and implements dslabs.framework.Client —
  * the same pattern as PaxosClient in the Paxos lab.
  *
- * The Client interface is synchronization-aware: sendCommand / hasResult /
- * getResult are called from an external thread (the test harness or demo),
- * while handleFoo handlers are called by the framework.  All public methods
- * are synchronized.  getResult blocks using wait/notifyAll — exactly as
- * PaxosClient does.
+ * AUTHENTICATION
+ * --------------
+ * Before issuing any commands, the client performs a challenge-response
+ * handshake with the coordinator:
+ *   1. Client sends AuthRequest(clientId) in init().
+ *   2. Coordinator replies with AuthChallenge(nonce).
+ *   3. Client computes HMAC-SHA256(sharedSecret, nonce), sends AuthResponse.
+ *   4. Coordinator verifies, returns AuthResultMsg with a session token.
+ * sendCommand() blocks until the handshake completes — exactly like
+ * getResult() blocks until the response arrives.
  *
- * Command types accepted:
- *   CapstoneWrite (key, value)  → sends WriteRequest to coordinator
- *   CapstoneRead  (key)         → sends ReadRequest to coordinator
- *
- * Result types:
- *   CapstoneWriteResult (success, error)
- *   CapstoneReadResult  (value, error)
- *
- * A ClientRetryTimer re-broadcasts the pending request if no response arrives
- * within CLIENT_RETRY_MILLIS.  This handles message loss in a real network.
- * In the in-memory demo the timer fires only if we explicitly trigger it.
+ * All subsequent WriteRequest/ReadRequest include the session token.
+ * The shared secret never travels over the wire.
  */
 @ToString(callSuper = true)
 @EqualsAndHashCode(callSuper = true)
 public final class CapstoneClient extends Node implements Client {
 
     private final Address coordinator;
+    private final byte[]  sharedSecret;
 
     // Sequence number for the next request
     private int nextSeq;
@@ -48,9 +47,14 @@ public final class CapstoneClient extends Node implements Client {
     // Set when the response arrives; cleared when sendCommand is called
     private Result pendingResult;
 
-    public CapstoneClient(Address address, Address coordinator) {
+    // --- Authentication state ---
+    private boolean authenticated;
+    private String  sessionToken;
+
+    public CapstoneClient(Address address, Address coordinator, byte[] sharedSecret) {
         super(address);
-        this.coordinator = coordinator;
+        this.coordinator  = coordinator;
+        this.sharedSecret = sharedSecret;
     }
 
     @Override
@@ -59,6 +63,12 @@ public final class CapstoneClient extends Node implements Client {
         pendingSeq     = -1;
         pendingCommand = null;
         pendingResult  = null;
+        authenticated  = false;
+        sessionToken   = null;
+
+        // Initiate authentication handshake
+        send(new AuthRequest(address().toString()), coordinator);
+        set(new AuthRetryTimer(), AuthRetryTimer.AUTH_RETRY_MILLIS);
     }
 
     // =========================================================================
@@ -67,8 +77,9 @@ public final class CapstoneClient extends Node implements Client {
 
     /**
      * Send a command to the coordinator.
-     * Wraps the command in a WriteRequest or ReadRequest with the current
-     * sequence number, then sets a retry timer.
+     * If authentication hasn't completed yet, the request is sent with a null
+     * session token.  The coordinator will reject it with AUTH_REQUIRED, which
+     * the client ignores.  The ClientRetryTimer re-sends after auth completes.
      */
     @Override
     public synchronized void sendCommand(Command command) {
@@ -99,11 +110,44 @@ public final class CapstoneClient extends Node implements Client {
     }
 
     // =========================================================================
-    //  Message handlers — called by framework (reflection dispatch)
+    //  Authentication handlers
+    // =========================================================================
+
+    private synchronized void handleAuthChallenge(AuthChallenge challenge, Address sender) {
+        if (authenticated) return;
+        log("Received auth challenge, computing HMAC");
+        byte[] hmac = hmacSha256(sharedSecret, challenge.nonce());
+        send(new AuthResponse(address().toString(), hmac), coordinator);
+    }
+
+    private synchronized void handleAuthResultMsg(AuthResultMsg result, Address sender) {
+        if (authenticated) return;
+        if (result.success()) {
+            sessionToken  = result.sessionToken();
+            authenticated = true;
+            log("Authenticated, token=" + sessionToken);
+            notifyAll();  // wake up any blocked sendCommand
+        } else {
+            log("Auth failed: " + result.error());
+        }
+    }
+
+    private synchronized void onAuthRetryTimer(AuthRetryTimer t) {
+        if (authenticated) return;
+        log("Retrying auth");
+        send(new AuthRequest(address().toString()), coordinator);
+        set(t, AuthRetryTimer.AUTH_RETRY_MILLIS);
+    }
+
+    // =========================================================================
+    //  Command response handlers — called by framework (reflection dispatch)
     // =========================================================================
 
     private synchronized void handleWriteResponse(WriteResponse resp, Address sender) {
         if (pendingCommand == null || pendingSeq != resp.sequenceNum()) return;
+
+        // Ignore AUTH_REQUIRED — retry timer will re-send after auth completes
+        if ("AUTH_REQUIRED".equals(resp.error())) return;
 
         pendingResult  = new CapstoneWriteResult(resp.success(), resp.error());
         pendingCommand = null;
@@ -112,6 +156,9 @@ public final class CapstoneClient extends Node implements Client {
 
     private synchronized void handleReadResponse(ReadResponse resp, Address sender) {
         if (pendingCommand == null || pendingSeq != resp.sequenceNum()) return;
+
+        // Ignore AUTH_REQUIRED — retry timer will re-send after auth completes
+        if ("AUTH_REQUIRED".equals(resp.error())) return;
 
         pendingResult  = new CapstoneReadResult(resp.value(), resp.error());
         pendingCommand = null;
@@ -123,7 +170,6 @@ public final class CapstoneClient extends Node implements Client {
     // =========================================================================
 
     private synchronized void onClientRetryTimer(ClientRetryTimer t) {
-        // Ignore stale timer fires from previous requests
         if (pendingCommand == null || t.sequenceNum() != pendingSeq) return;
 
         log("Retrying seq=" + pendingSeq);
@@ -139,18 +185,23 @@ public final class CapstoneClient extends Node implements Client {
     private void sendPending() {
         if (pendingCommand instanceof CapstoneWrite) {
             CapstoneWrite w = (CapstoneWrite) pendingCommand;
-            send(new WriteRequest(address().toString(), pendingSeq, w.key(), w.value()), coordinator);
+            send(new WriteRequest(address().toString(), pendingSeq,
+                    w.key(), w.value(), sessionToken), coordinator);
         } else if (pendingCommand instanceof CapstoneRead) {
             CapstoneRead r = (CapstoneRead) pendingCommand;
-            send(new ReadRequest(address().toString(), pendingSeq, r.key()), coordinator);
+            send(new ReadRequest(address().toString(), pendingSeq,
+                    r.key(), sessionToken), coordinator);
         } else {
             throw new IllegalArgumentException("Unknown command type: " + pendingCommand);
         }
     }
 
-    /** Returns the sequence number used by the most recently sent command. */
-    public synchronized int getLastUsedSeq() {
-        return nextSeq - 1;
+    private static byte[] hmacSha256(byte[] key, byte[] data) {
+        try {
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec(key, "HmacSHA256"));
+            return mac.doFinal(data);
+        } catch (Exception e) { throw new RuntimeException("HMAC failed", e); }
     }
 
     private void log(String msg) {

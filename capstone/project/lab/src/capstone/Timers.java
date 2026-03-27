@@ -16,6 +16,15 @@ import lombok.Data;
  */
 
 /**
+ * Client auth retry timer.
+ * If the client hasn't received an AuthResult, it re-sends AuthRequest.
+ */
+@Data
+final class AuthRetryTimer implements Timer {
+    static final int AUTH_RETRY_MILLIS = 100;
+}
+
+/**
  * Client retry timer.
  * If the client hasn't received a response for its pending request, it
  * re-broadcasts the request.  Carries the sequence number so we can

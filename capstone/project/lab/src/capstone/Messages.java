@@ -18,6 +18,7 @@ import lombok.NonNull;
  * the demo (the framework's correctness checks don't inspect message payloads).
  *
  * Groups:
+ *   0. Authentication (challenge-response handshake)
  *   1. Client <-> Coordinator
  *   2. Coordinator -> Region  (writes)
  *   3. Coordinator -> Region  (reads)
@@ -26,18 +27,71 @@ import lombok.NonNull;
  */
 
 // =============================================================================
+//  0. Authentication (challenge-response)
+// =============================================================================
+
+/** Client initiates authentication. */
+@Data
+final class AuthRequest implements Message {
+    @NonNull private final String clientId;
+}
+
+/** Coordinator sends a random nonce for the client to prove identity. */
+@Data
+final class AuthChallenge implements Message {
+    @NonNull private final String clientId;
+    @NonNull private final byte[] nonce;
+
+    @Override public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof AuthChallenge)) return false;
+        AuthChallenge that = (AuthChallenge) o;
+        return clientId.equals(that.clientId) && Arrays.equals(nonce, that.nonce);
+    }
+    @Override public int hashCode() {
+        return java.util.Objects.hash(clientId, Arrays.hashCode(nonce));
+    }
+}
+
+/** Client proves identity by returning HMAC(sharedSecret, nonce). */
+@Data
+final class AuthResponse implements Message {
+    @NonNull private final String clientId;
+    @NonNull private final byte[] hmac;
+
+    @Override public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof AuthResponse)) return false;
+        AuthResponse that = (AuthResponse) o;
+        return clientId.equals(that.clientId) && Arrays.equals(hmac, that.hmac);
+    }
+    @Override public int hashCode() {
+        return java.util.Objects.hash(clientId, Arrays.hashCode(hmac));
+    }
+}
+
+/** Coordinator grants (or denies) a session token after verifying the HMAC. */
+@Data
+final class AuthResultMsg implements Message {
+    @NonNull private final String clientId;
+    private final String          sessionToken;  // null on failure
+    private final boolean         success;
+    private final String          error;         // null on success
+}
+
+// =============================================================================
 //  1. Client <-> Coordinator
 // =============================================================================
 
-/** Client requests a write. Carries (clientId, seqNum) for AMO dedup. */
+/** Client requests a write. Carries (clientId, seqNum) for AMO dedup and sessionToken for auth. */
 @Data
 final class WriteRequest implements Message {
     @NonNull private final String clientId;
     private final int             sequenceNum;
     @NonNull private final String key;
     @NonNull private final byte[] value;  // plaintext
+    private final String          sessionToken;
 
-    // byte[] needs manual equals/hashCode
     @Override public boolean equals(Object o) {
         if (this == o) return true;
         if (!(o instanceof WriteRequest)) return false;
@@ -45,10 +99,12 @@ final class WriteRequest implements Message {
         return sequenceNum == that.sequenceNum
             && clientId.equals(that.clientId)
             && key.equals(that.key)
-            && Arrays.equals(value, that.value);
+            && Arrays.equals(value, that.value)
+            && java.util.Objects.equals(sessionToken, that.sessionToken);
     }
     @Override public int hashCode() {
-        return java.util.Objects.hash(clientId, sequenceNum, key, Arrays.hashCode(value));
+        return java.util.Objects.hash(clientId, sequenceNum, key,
+            Arrays.hashCode(value), sessionToken);
     }
 }
 
@@ -67,6 +123,7 @@ final class ReadRequest implements Message {
     @NonNull private final String clientId;
     private final int             sequenceNum;
     @NonNull private final String key;
+    private final String          sessionToken;
 }
 
 /** Coordinator returns decrypted plaintext (or error) to the client. */
