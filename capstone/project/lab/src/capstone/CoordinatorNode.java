@@ -76,21 +76,28 @@ public class CoordinatorNode extends Node {
 
     private static final SecureRandom RNG = new SecureRandom();
 
-    // --- Fixed configuration (set in constructor, immutable) ---
-    private final Address[] regions;    // ordered list of region addresses
-    private final int       k;          // erasure coding: data fragments
-    private final int       m;          // erasure coding: parity fragments
-    private final int       keyThreshold;
+    // --- Configuration (k is fixed; m and regions grow on dynamic join) ---
+    private final java.util.List<Address> regions;  // ordered, grows on join
+    private final int       k;                       // erasure coding: data fragments (fixed)
+    private int             m;                       // erasure coding: parity fragments (grows)
+    private int             keyThreshold;            // Shamir threshold (may grow)
 
-    // Precomputed erasure coder (stateless, safe to share)
-    private final ErasureCoder erasureCoder;
+    // Precomputed erasure coder (recreated when m changes)
+    private ErasureCoder erasureCoder;
 
     // Whether to send periodic heartbeats (disabled during search tests
     // to prevent infinite state space expansion)
     private final boolean enableHeartbeats;
 
-    // --- Authentication secrets (clientId -> pre-shared secret, immutable) ---
+    // --- Authentication secrets (clientId -> pre-shared secret) ---
     private final Map<String, byte[]> clientSecrets;
+
+    // --- Cluster secret for region join authentication ---
+    private final byte[] clusterSecret;
+
+    // --- Dynamic membership state ---
+    private boolean reconfiguring;       // true while waiting for pending writes to drain
+    private Address pendingJoinRegion;   // the region waiting to be added (null if none)
 
     // --- Version metadata ---
     // objectKey -> (versionNum -> VersionMetadata)
@@ -130,20 +137,36 @@ public class CoordinatorNode extends Node {
 
     public CoordinatorNode(Address address, Address[] regions, int k, int m,
                            int keyThreshold, Map<String, byte[]> clientSecrets) {
-        this(address, regions, k, m, keyThreshold, clientSecrets, true);
+        this(address, regions, k, m, keyThreshold, clientSecrets, true, null);
     }
 
     public CoordinatorNode(Address address, Address[] regions, int k, int m,
                            int keyThreshold, Map<String, byte[]> clientSecrets,
                            boolean enableHeartbeats) {
+        this(address, regions, k, m, keyThreshold, clientSecrets, enableHeartbeats, null);
+    }
+
+    public CoordinatorNode(Address address, Address[] regions, int k, int m,
+                           int keyThreshold, Map<String, byte[]> clientSecrets,
+                           boolean enableHeartbeats, byte[] clusterSecret) {
         super(address);
-        this.regions          = regions;
+
+        // Validate configuration
+        if (k < 1) throw new IllegalArgumentException("k must be >= 1, got " + k);
+        if (m < 0) throw new IllegalArgumentException("m must be >= 0, got " + m);
+        if (keyThreshold < 1 || keyThreshold > k + m)
+            throw new IllegalArgumentException("keyThreshold must be in [1, k+m], got " + keyThreshold);
+        if (regions.length != k + m)
+            throw new IllegalArgumentException("regions.length must equal k+m=" + (k+m) + ", got " + regions.length);
+
+        this.regions          = new java.util.ArrayList<>(java.util.Arrays.asList(regions));
         this.k                = k;
         this.m                = m;
         this.keyThreshold     = keyThreshold;
         this.erasureCoder     = new ErasureCoder(k, m);
         this.clientSecrets    = clientSecrets;
         this.enableHeartbeats = enableHeartbeats;
+        this.clusterSecret    = clusterSecret;
     }
 
     @Override
@@ -158,6 +181,8 @@ public class CoordinatorNode extends Node {
         pendingAuths    = new HashMap<>();
         validSessions   = new HashMap<>();
         keyOwner        = new HashMap<>();
+        reconfiguring   = false;
+        pendingJoinRegion = null;
 
         // Assume all regions alive at startup; they'll confirm via heartbeat.
         long now = System.currentTimeMillis();
@@ -318,6 +343,13 @@ public class CoordinatorNode extends Node {
             return;
         }
 
+        // --- Reject new writes during reconfiguration (transient) ---
+        if (reconfiguring) {
+            log("Reconfiguring: rejecting write for key=" + req.key());
+            send(new WriteResponse(req.clientId(), req.sequenceNum(), false, "RECONFIGURING"), sender);
+            return;
+        }
+
         // --- One pending write per key at a time ---
         if (pendingWrites.containsKey(req.key())) {
             PendingWrite pw = pendingWrites.get(req.key());
@@ -330,14 +362,14 @@ public class CoordinatorNode extends Node {
                     + " (frags=" + pw.fragmentAcks.size() + "/" + k
                     + ", shares=" + pw.keyShareAcks.size() + "/" + keyThreshold + ")");
                 for (int i = 0; i < k + m; i++) {
-                    if (!isRegionAlive(regions[i])) continue;
+                    if (!isRegionAlive(regions.get(i))) continue;
                     if (!pw.fragmentAcks.contains(i)) {
                         send(new FragmentWrite(req.key(), pw.version, i,
-                            pw.fragments[i], pw.checksums.get(i)), regions[i]);
+                            pw.fragments[i], pw.checksums.get(i)), regions.get(i));
                     }
                     if (!pw.keyShareAcks.contains(i)) {
                         send(new KeyShareWrite(req.key(), pw.version, i,
-                            pw.keyShares[i]), regions[i]);
+                            pw.keyShares[i]), regions.get(i));
                     }
                 }
                 return;
@@ -389,12 +421,12 @@ public class CoordinatorNode extends Node {
         // --- Fan out: send fragment + key share to alive regions only ---
         int sent = 0;
         for (int i = 0; i < k + m; i++) {
-            if (isRegionAlive(regions[i])) {
-                send(new FragmentWrite(req.key(), version, i, frags[i], checksums.get(i)), regions[i]);
-                send(new KeyShareWrite(req.key(), version, i, shares[i]), regions[i]);
+            if (isRegionAlive(regions.get(i))) {
+                send(new FragmentWrite(req.key(), version, i, frags[i], checksums.get(i)), regions.get(i));
+                send(new KeyShareWrite(req.key(), version, i, shares[i]), regions.get(i));
                 sent++;
             } else {
-                log("Skipping dead region-" + i + " (" + regions[i] + ")");
+                log("Skipping dead region-" + i + " (" + regions.get(i) + ")");
             }
         }
         log("Sent to " + sent + "/" + (k + m) + " alive regions; waiting for acks");
@@ -464,6 +496,11 @@ public class CoordinatorNode extends Node {
         send(resp, pending.clientSender);
 
         pendingWrites.remove(pending.key);
+
+        // If reconfiguring and all writes drained, apply the pending join
+        if (reconfiguring && pendingWrites.isEmpty()) {
+            applyJoin();
+        }
     }
 
     // =========================================================================
@@ -505,25 +542,17 @@ public class CoordinatorNode extends Node {
                     + " (frags=" + pr.fragments.size() + "/" + k
                     + ", shares=" + pr.keyShares.size() + "/" + keyThreshold + ")");
                 for (int i = 0; i < k + m; i++) {
-                    if (!isRegionAlive(regions[i])) continue;
+                    if (!isRegionAlive(regions.get(i))) continue;
                     if (!pr.fragments.containsKey(i)) {
-                        send(new FragmentReadRequest(req.key(), pr.version, i), regions[i]);
+                        send(new FragmentReadRequest(req.key(), pr.version, i), regions.get(i));
                     }
                     if (!pr.keyShares.containsKey(i)) {
-                        send(new KeyShareReadRequest(req.key(), pr.version, i), regions[i]);
+                        send(new KeyShareReadRequest(req.key(), pr.version, i), regions.get(i));
                     }
                 }
                 return;
             }
             send(new ReadResponse(req.clientId(), req.sequenceNum(), null, "READ_IN_PROGRESS"), sender);
-            return;
-        }
-
-        // --- Fast-fail if insufficient alive regions ---
-        int alive = countAliveRegions();
-        if (alive < minRegionsRequired()) {
-            log("Rejected: only " + alive + " regions alive, need " + minRegionsRequired());
-            send(new ReadResponse(req.clientId(), req.sequenceNum(), null, "INSUFFICIENT_REGIONS"), sender);
             return;
         }
 
@@ -534,20 +563,33 @@ public class CoordinatorNode extends Node {
             return;
         }
 
+        // --- Per-version fast-fail: check alive regions against this version's thresholds ---
+        VersionMetadata meta = allVersions.get(req.key()).get(version);
+        int versionMinRegions = Math.max(meta.k, meta.keyThreshold);
+        int alive = countAliveRegions();
+        if (alive < versionMinRegions) {
+            log("Rejected read: only " + alive + " regions alive, version needs " + versionMinRegions);
+            send(new ReadResponse(req.clientId(), req.sequenceNum(), null, "INSUFFICIENT_REGIONS"), sender);
+            return;
+        }
+
         log("Reading key=" + req.key() + " at v=" + version);
 
         PendingRead pending = new PendingRead(req.clientId(), req.sequenceNum(), req.key(), version, sender);
         pendingReads.put(req.key(), pending);
 
-        // Fan out to alive regions only — skip dead ones to save traffic
+        // Fan out to alive regions only — skip dead ones to save traffic.
+        // Fan out to ALL regions (including those added after this version was written);
+        // regions without the fragment will reply null, which is handled.
+        int numRegions = meta.k + meta.m;  // version's region count (may be < current)
         int sent = 0;
-        for (int i = 0; i < k + m; i++) {
-            if (isRegionAlive(regions[i])) {
-                send(new FragmentReadRequest(req.key(), version, i), regions[i]);
-                send(new KeyShareReadRequest(req.key(), version, i), regions[i]);
+        for (int i = 0; i < Math.min(numRegions, regions.size()); i++) {
+            if (isRegionAlive(regions.get(i))) {
+                send(new FragmentReadRequest(req.key(), version, i), regions.get(i));
+                send(new KeyShareReadRequest(req.key(), version, i), regions.get(i));
                 sent++;
             } else {
-                log("Skipping dead region-" + i + " (" + regions[i] + ")");
+                log("Skipping dead region-" + i + " (" + regions.get(i) + ")");
             }
         }
         log("Sent fragment + key-share requests to " + sent + "/" + (k + m) + " alive regions");
@@ -565,8 +607,15 @@ public class CoordinatorNode extends Node {
             return;
         }
 
-        // Integrity check: reject corrupted or tampered fragments
+        // Bounds check: reject fragments from regions outside this version's config
         VersionMetadata meta = allVersions.get(reply.key()).get(reply.version());
+        if (reply.regionIndex() >= meta.k + meta.m) {
+            log("Ignoring fragment from region-" + reply.regionIndex()
+                + " — outside version's k+m=" + (meta.k + meta.m));
+            return;
+        }
+
+        // Integrity check: reject corrupted or tampered fragments
         if (!meta.verifyFragment(reply.regionIndex(), reply.fragment())) {
             log("*** Checksum FAILED for fragment from region-" + reply.regionIndex()
                 + " key=" + reply.key() + " — rejecting ***");
@@ -575,7 +624,7 @@ public class CoordinatorNode extends Node {
 
         pending.fragments.put(reply.regionIndex(), reply.fragment());
         log("Accepted fragment from region-" + reply.regionIndex()
-            + " (have " + pending.fragments.size() + "/" + k + ")");
+            + " (have " + pending.fragments.size() + "/" + meta.k + ")");
         tryCompleteRead(pending);
     }
 
@@ -588,9 +637,17 @@ public class CoordinatorNode extends Node {
             return;
         }
 
+        // Bounds check: reject shares from regions outside this version's config
+        VersionMetadata meta = allVersions.get(reply.key()).get(reply.version());
+        if (reply.regionIndex() >= meta.k + meta.m) {
+            log("Ignoring key share from region-" + reply.regionIndex()
+                + " — outside version's k+m=" + (meta.k + meta.m));
+            return;
+        }
+
         pending.keyShares.put(reply.regionIndex(), reply.keyShare());
         log("Accepted key share from region-" + reply.regionIndex()
-            + " (have " + pending.keyShares.size() + "/" + keyThreshold + ")");
+            + " (have " + pending.keyShares.size() + "/" + meta.keyThreshold + ")");
         tryCompleteRead(pending);
     }
 
@@ -603,18 +660,24 @@ public class CoordinatorNode extends Node {
      */
     private void tryCompleteRead(PendingRead pending) {
         if (pending.completed) return;
-        if (pending.fragments.size() < k)            return;
-        if (pending.keyShares.size() < keyThreshold) return;
+
+        // Use the version's stored k/m/keyThreshold — may differ from current
+        // global config if the system was reconfigured after this version was written.
+        VersionMetadata meta = allVersions.get(pending.key).get(pending.version);
+        if (pending.fragments.size() < meta.k)            return;
+        if (pending.keyShares.size() < meta.keyThreshold) return;
 
         pending.completed = true;
 
-        VersionMetadata meta = allVersions.get(pending.key).get(pending.version);
-
-        // Reconstruct ciphertext from k fragments
-        byte[][] allFrags = new byte[k + m][];
+        // Reconstruct ciphertext using the version's erasure coding params
+        ErasureCoder versionCoder = (meta.k == k && meta.m == m)
+                ? erasureCoder  // reuse global if same config
+                : new ErasureCoder(meta.k, meta.m);
+        byte[][] allFrags = new byte[meta.k + meta.m][];
         pending.fragments.forEach((idx, frag) -> allFrags[idx] = frag);
-        byte[] ciphertext = erasureCoder.decode(allFrags, meta.originalCiphertextLength);
-        log("Reconstructed ciphertext from " + pending.fragments.size() + " fragments");
+        byte[] ciphertext = versionCoder.decode(allFrags, meta.originalCiphertextLength);
+        log("Reconstructed ciphertext from " + pending.fragments.size()
+            + " fragments (version k=" + meta.k + ", m=" + meta.m + ")");
 
         // Reconstruct AES key from key shares
         int n = pending.keyShares.size();
@@ -655,6 +718,83 @@ public class CoordinatorNode extends Node {
         log("Heartbeat reply from " + sender);
     }
 
+    // =========================================================================
+    //  DYNAMIC MEMBERSHIP
+    // =========================================================================
+
+    private void handleJoinRequest(JoinRequest req, Address sender) {
+        log("JoinRequest from " + sender);
+
+        // Verify cluster secret
+        if (clusterSecret == null) {
+            log("Rejected join: dynamic membership not enabled (no cluster secret)");
+            send(new JoinResult(false, "MEMBERSHIP_DISABLED"), sender);
+            return;
+        }
+
+        byte[] expected = hmacSha256(clusterSecret, sender.toString().getBytes());
+        if (!Arrays.equals(expected, req.hmac())) {
+            log("Rejected join: HMAC mismatch from " + sender);
+            send(new JoinResult(false, "AUTH_FAILED"), sender);
+            return;
+        }
+
+        // Check if already a member
+        if (regions.contains(sender)) {
+            log("Already a member: " + sender);
+            send(new JoinResult(true, null), sender);
+            return;
+        }
+
+        // Check if already reconfiguring
+        if (reconfiguring) {
+            log("Rejected join: reconfiguration already in progress");
+            send(new JoinResult(false, "RECONFIG_IN_PROGRESS"), sender);
+            return;
+        }
+
+        // Begin reconfiguration: stop accepting new writes until in-flight drain
+        reconfiguring     = true;
+        pendingJoinRegion = sender;
+        log("*** RECONFIGURING: waiting for " + pendingWrites.size()
+            + " pending writes to drain before adding " + sender + " ***");
+
+        // If no pending writes, apply immediately
+        if (pendingWrites.isEmpty()) {
+            applyJoin();
+        } else {
+            // Arm timeout to abort if writes don't drain
+            set(new ReconfigTimeoutTimer(), ReconfigTimeoutTimer.RECONFIG_TIMEOUT_MILLIS);
+        }
+    }
+
+    /** Apply the pending region join: add region, increase m, recreate coder. */
+    private void applyJoin() {
+        Address newRegion = pendingJoinRegion;
+        regions.add(newRegion);
+        m = m + 1;
+        erasureCoder = new ErasureCoder(k, m);
+        lastHeartbeat.put(newRegion, System.currentTimeMillis());
+        reconfiguring     = false;
+        pendingJoinRegion = null;
+
+        log("*** JOIN COMPLETE: added " + newRegion
+            + " — now " + regions.size() + " regions (k=" + k + ", m=" + m
+            + ", keyThreshold=" + keyThreshold + ") ***");
+        send(new JoinResult(true, null), newRegion);
+    }
+
+    private void onReconfigTimeoutTimer(ReconfigTimeoutTimer t) {
+        if (!reconfiguring) return;
+
+        log("*** RECONFIG TIMEOUT: aborting join of " + pendingJoinRegion
+            + " (" + pendingWrites.size() + " writes still pending) ***");
+        Address failedRegion = pendingJoinRegion;
+        reconfiguring     = false;
+        pendingJoinRegion = null;
+        send(new JoinResult(false, "RECONFIG_TIMEOUT"), failedRegion);
+    }
+
     /**
      * Read timeout: fail the pending read if we haven't collected enough
      * fragments or key shares yet.
@@ -693,6 +833,11 @@ public class CoordinatorNode extends Node {
         pendingWrites.remove(t.key());
         // Note: the partial version remains in allVersions but is uncommitted,
         // so it will never be visible to readers.  It can be GC'd later.
+
+        // If reconfiguring and all writes drained, apply the pending join
+        if (reconfiguring && pendingWrites.isEmpty()) {
+            applyJoin();
+        }
     }
 
     // =========================================================================
@@ -743,11 +888,14 @@ public class CoordinatorNode extends Node {
         if (entry == null) return null;
         if (seqNum == entry.seqNum) return entry.response;
         if (seqNum < entry.seqNum) {
-            // Stale replay — the client has moved on. Return a generic success
-            // to prevent infinite retries of an already-superseded command.
+            // Stale replay — the client has moved on to a higher seqNum.
+            // We only cache committed (successful) writes, so if this old seqNum
+            // isn't cached, the original write may have failed. Return the latest
+            // cached response as a signal to stop retrying — the client has already
+            // progressed past this seqNum regardless.
             log("Dedup: stale replay from " + clientId + " seq=" + seqNum
-                + " (latest=" + entry.seqNum + ")");
-            return new WriteResponse(clientId, seqNum, true, null);
+                + " (latest=" + entry.seqNum + "), returning cached latest");
+            return entry.response;
         }
         return null; // seqNum > lastProcessed → new command, not a replay
     }

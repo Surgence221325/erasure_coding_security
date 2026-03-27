@@ -96,6 +96,16 @@ final class WriteTimeoutTimer implements Timer {
 }
 
 /**
+ * Coordinator reconfiguration timeout timer.
+ * If pending writes don't drain within this window after a JoinRequest,
+ * the join is aborted to prevent indefinite write rejection.
+ */
+@Data
+final class ReconfigTimeoutTimer implements Timer {
+    static final int RECONFIG_TIMEOUT_MILLIS = 2000;
+}
+
+/**
  * Coordinator read timeout timer.
  * If we can't collect k valid fragments + keyThreshold shares within this window,
  * fail the read gracefully rather than blocking forever.

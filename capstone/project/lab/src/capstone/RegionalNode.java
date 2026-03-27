@@ -38,20 +38,45 @@ public class RegionalNode extends Node {
     // Used in corruption injection tests to verify coordinator checksum detection.
     private final boolean corruptFragmentsOnRead;
 
+    // --- Dynamic membership: if set, region sends JoinRequest on init ---
+    private final Address coordinatorAddress;
+    private final byte[]  clusterSecret;
+
     public RegionalNode(Address address) {
-        this(address, false);
+        this(address, false, null, null);
     }
 
     public RegionalNode(Address address, boolean corruptFragmentsOnRead) {
+        this(address, corruptFragmentsOnRead, null, null);
+    }
+
+    public RegionalNode(Address address, boolean corruptFragmentsOnRead,
+                        Address coordinatorAddress, byte[] clusterSecret) {
         super(address);
         this.corruptFragmentsOnRead = corruptFragmentsOnRead;
+        this.coordinatorAddress     = coordinatorAddress;
+        this.clusterSecret          = clusterSecret;
     }
 
     @Override
     public void init() {
         fragments = new HashMap<>();
         keyShares = new HashMap<>();
-        // Regions don't set any timers on init — they're passive responders.
+
+        // If configured for dynamic join, send JoinRequest to coordinator
+        if (coordinatorAddress != null && clusterSecret != null) {
+            byte[] hmac = hmacSha256(clusterSecret, address().toString().getBytes());
+            send(new JoinRequest(hmac), coordinatorAddress);
+            log("Sent JoinRequest to " + coordinatorAddress);
+        }
+    }
+
+    private static byte[] hmacSha256(byte[] key, byte[] data) {
+        try {
+            javax.crypto.Mac mac = javax.crypto.Mac.getInstance("HmacSHA256");
+            mac.init(new javax.crypto.spec.SecretKeySpec(key, "HmacSHA256"));
+            return mac.doFinal(data);
+        } catch (Exception e) { throw new RuntimeException("HMAC failed", e); }
     }
 
     // -------------------------------------------------------------------------
@@ -166,6 +191,18 @@ public class RegionalNode extends Node {
     private void handleHeartbeatMsg(HeartbeatMsg m, Address sender) {
         // Just reply — the reply itself is what the coordinator needs.
         send(new HeartbeatReply(), sender);
+    }
+
+    // -------------------------------------------------------------------------
+    //  Dynamic membership
+    // -------------------------------------------------------------------------
+
+    private void handleJoinResult(JoinResult result, Address sender) {
+        if (result.success()) {
+            log("*** Successfully joined cluster ***");
+        } else {
+            log("Join rejected: " + result.error());
+        }
     }
 
     // -------------------------------------------------------------------------

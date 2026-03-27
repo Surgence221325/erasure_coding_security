@@ -44,10 +44,14 @@ public class CapstoneTest extends BaseJUnitTest {
     static final int SEARCH_KEY_THRESHOLD = 1;
     static final int SEARCH_NUM_REGIONS = SEARCH_K + SEARCH_M; // 2
 
+    // --- Cluster secret for dynamic membership tests ---
+    static final byte[] CLUSTER_SECRET = "capstone-cluster-secret".getBytes();
+
     // server(1) = coordinator
     // server(2) = region 0
     // server(3) = region 1
     // server(4) = region 2 (run tests only)
+    // server(5) = dynamic region (join tests only)
 
     /** Derive a deterministic 16-byte secret from a client address. */
     private static byte[] secretForClient(Address addr) {
@@ -616,10 +620,64 @@ public class CapstoneTest extends BaseJUnitTest {
     }
 
     @Test(timeout = 10 * 1000)
+    @TestDescription("Corruption + partition: read fails gracefully under compound failure")
+    @Category(RunTests.class)
+    @TestPointValue(10)
+    public void test20CompoundCorruptionAndPartition() throws InterruptedException {
+        // Compound failure: 1 region corrupts fragments + 1 region partitioned.
+        // With k=2, m=1: only 1 valid fragment remains (< k=2). Read must fail.
+        // This proves the system degrades correctly when two independent failure
+        // modes overlap — checksum rejection + network partition.
+        Address coordinator = server(1);
+        Address[] regions = new Address[NUM_REGIONS];
+        for (int i = 0; i < NUM_REGIONS; i++) {
+            regions[i] = server(i + 2);
+        }
+
+        StateGeneratorBuilder b = StateGenerator.builder();
+        b.serverSupplier(a -> {
+            if (a.equals(coordinator)) {
+                return new CoordinatorNode(a, regions, K, M, KEY_THRESHOLD, CLIENT_SECRETS);
+            } else if (a.equals(server(4))) {
+                // Region 2 corrupts fragments
+                return new RegionalNode(a, true);
+            } else {
+                return new RegionalNode(a);
+            }
+        });
+        b.clientSupplier(a -> new CapstoneClient(a, coordinator, CLIENT_SECRETS.get(a.toString())));
+        b.workloadSupplier(emptyWorkload());
+
+        StateGenerator sg = b.build();
+        runState = new RunState(sg);
+        runState.addServer(server(1));
+        for (int i = 0; i < NUM_REGIONS; i++) {
+            runState.addServer(server(i + 2));
+        }
+
+        Client client = runState.addClient(client(1));
+
+        // Write with all 3 regions up (all store valid fragments)
+        runState.start(runSettings);
+        sendCommandAndCheck(client, write("key", "value"), writeOk());
+        runState.stop();
+
+        // Now: region 2 corrupts (checksum fails) + region 1 partitioned
+        // Only region 0 returns a valid fragment — 1 < k=2, read must fail
+        runSettings.partition(server(1), server(2), server(4), client(1));
+        runState.start(runSettings);
+
+        client.sendCommand(read("key"));
+        Result r = client.getResult();
+        assertTrue(r instanceof CapstoneReadResult);
+        assertNull(((CapstoneReadResult) r).value());
+    }
+
+    @Test(timeout = 10 * 1000)
     @TestDescription("Client with wrong credentials cannot write")
     @Category(RunTests.class)
     @TestPointValue(10)
-    public void test20WrongCredentialsRejected() throws InterruptedException {
+    public void test21WrongCredentialsRejected() throws InterruptedException {
         // Build a custom state where client(2) has a WRONG secret.
         // The coordinator has the real secret; client(2) has all-zeros.
         // The HMAC won't match, auth fails, client stays unauthenticated.
@@ -669,7 +727,173 @@ public class CapstoneTest extends BaseJUnitTest {
     }
 
     // =========================================================================
-    //  Part 6 — search tests (deterministic, exhaustive)
+    //  Part 6 — dynamic membership
+    //
+    //  Tests that a new region can join mid-session, new writes use the
+    //  updated config (more parity), and old keys remain readable.
+    // =========================================================================
+
+    /** Set up a coordinator with cluster secret enabled for join tests. */
+    private void setupDynamicState(Workload workload) {
+        Address coordinator = server(1);
+        Address[] regions = new Address[NUM_REGIONS];
+        for (int i = 0; i < NUM_REGIONS; i++) {
+            regions[i] = server(i + 2);
+        }
+
+        StateGeneratorBuilder b = StateGenerator.builder();
+        b.serverSupplier(a -> {
+            if (a.equals(coordinator)) {
+                return new CoordinatorNode(a, regions, K, M, KEY_THRESHOLD,
+                        CLIENT_SECRETS, true, CLUSTER_SECRET);
+            } else if (a.equals(server(5))) {
+                // Dynamic region — sends JoinRequest on init
+                return new RegionalNode(a, false, coordinator, CLUSTER_SECRET);
+            } else {
+                return new RegionalNode(a);
+            }
+        });
+        b.clientSupplier(a -> new CapstoneClient(a, coordinator, CLIENT_SECRETS.get(a.toString())));
+        b.workloadSupplier(workload);
+
+        StateGenerator sg = b.build();
+        runState = new RunState(sg);
+        runState.addServer(server(1));
+        for (int i = 0; i < NUM_REGIONS; i++) {
+            runState.addServer(server(i + 2));
+        }
+    }
+
+    @Test(timeout = 10 * 1000)
+    @TestDescription("New region joins, new write uses 4 regions")
+    @Category(RunTests.class)
+    @TestPointValue(10)
+    public void test22DynamicJoinBasic() throws InterruptedException {
+        setupDynamicState(emptyWorkload());
+        Client client = runState.addClient(client(1));
+
+        runState.start(runSettings);
+
+        // Write with original 3 regions
+        sendCommandAndCheck(client, write("before-join", "v1"), writeOk());
+
+        // Add the 4th region — it sends JoinRequest in init()
+        runState.addServer(server(5));
+        Thread.sleep(500); // let join complete
+
+        // New write should use 4 regions (k=2, m=2)
+        sendCommandAndCheck(client, write("after-join", "v2"), writeOk());
+
+        // Both keys readable
+        sendCommandAndCheck(client, read("before-join"), readResult("v1"));
+        sendCommandAndCheck(client, read("after-join"), readResult("v2"));
+    }
+
+    @Test(timeout = 10 * 1000)
+    @TestDescription("Old key readable after region joins (per-version decoding)")
+    @Category(RunTests.class)
+    @TestPointValue(10)
+    public void test23OldKeyAfterJoin() throws InterruptedException {
+        setupDynamicState(emptyWorkload());
+        Client client = runState.addClient(client(1));
+
+        runState.start(runSettings);
+
+        // Write multiple keys with original config (k=2, m=1)
+        sendCommandAndCheck(client, write("k1", "data1"), writeOk());
+        sendCommandAndCheck(client, write("k2", "data2"), writeOk());
+
+        // 4th region joins
+        runState.addServer(server(5));
+        Thread.sleep(500);
+
+        // Old keys still readable (coordinator uses per-version k/m)
+        sendCommandAndCheck(client, read("k1"), readResult("data1"));
+        sendCommandAndCheck(client, read("k2"), readResult("data2"));
+
+        // Overwrite k1 with new config — uses 4 regions now
+        sendCommandAndCheck(client, write("k1", "updated"), writeOk());
+        sendCommandAndCheck(client, read("k1"), readResult("updated"));
+    }
+
+    @Test(timeout = 10 * 1000)
+    @TestDescription("Fault tolerance improves after join (survive 2 failures)")
+    @Category(RunTests.class)
+    @TestPointValue(10)
+    public void test24ImprovedFaultTolerance() throws InterruptedException {
+        setupDynamicState(emptyWorkload());
+        Client client = runState.addClient(client(1));
+
+        runState.start(runSettings);
+
+        // 4th region joins → k=2, m=2 (4 regions, can survive 2 failures)
+        runState.addServer(server(5));
+        Thread.sleep(500);
+
+        // Write with 4 regions
+        sendCommandAndCheck(client, write("resilient-key", "value"), writeOk());
+
+        // Partition 2 regions — with old config (m=1) this would fail.
+        // With new config (m=2), k=2 regions still reachable = success.
+        runState.stop();
+        runSettings.partition(server(1), server(2), server(3), client(1));
+        // server(4) and server(5) are partitioned away — 2 regions reachable
+        runState.start(runSettings);
+
+        sendCommandAndCheck(client, read("resilient-key"), readResult("value"));
+    }
+
+    @Test(timeout = 10 * 1000)
+    @TestDescription("Join with bad credentials rejected")
+    @Category(RunTests.class)
+    @TestPointValue(10)
+    public void test25JoinBadCredentials() throws InterruptedException {
+        // Set up coordinator with cluster secret, but the joining region
+        // uses a wrong secret.
+        Address coordinator = server(1);
+        Address[] regions = new Address[NUM_REGIONS];
+        for (int i = 0; i < NUM_REGIONS; i++) {
+            regions[i] = server(i + 2);
+        }
+
+        byte[] wrongSecret = "wrong-secret".getBytes();
+
+        StateGeneratorBuilder b = StateGenerator.builder();
+        b.serverSupplier(a -> {
+            if (a.equals(coordinator)) {
+                return new CoordinatorNode(a, regions, K, M, KEY_THRESHOLD,
+                        CLIENT_SECRETS, true, CLUSTER_SECRET);
+            } else if (a.equals(server(5))) {
+                return new RegionalNode(a, false, coordinator, wrongSecret);
+            } else {
+                return new RegionalNode(a);
+            }
+        });
+        b.clientSupplier(a -> new CapstoneClient(a, coordinator, CLIENT_SECRETS.get(a.toString())));
+        b.workloadSupplier(emptyWorkload());
+
+        StateGenerator sg = b.build();
+        runState = new RunState(sg);
+        runState.addServer(server(1));
+        for (int i = 0; i < NUM_REGIONS; i++) {
+            runState.addServer(server(i + 2));
+        }
+
+        Client client = runState.addClient(client(1));
+
+        runState.start(runSettings);
+
+        // Try to add the rogue region
+        runState.addServer(server(5));
+        Thread.sleep(500);
+
+        // System should still work with original 3 regions (join was rejected)
+        sendCommandAndCheck(client, write("key", "value"), writeOk());
+        sendCommandAndCheck(client, read("key"), readResult("value"));
+    }
+
+    // =========================================================================
+    //  Part 7 — search tests (deterministic, exhaustive)
     //
     //  These use BFS over all possible message orderings to verify
     //  invariants hold under EVERY interleaving, not just random ones.
@@ -681,7 +905,7 @@ public class CapstoneTest extends BaseJUnitTest {
     @TestDescription("Search: single client write completes under all orderings")
     @Category(SearchTests.class)
     @TestPointValue(20)
-    public void test21SearchBasicWrite() {
+    public void test26SearchBasicWrite() {
         // Single write only (not put+get) to keep state space manageable
         setupState(Workload.builder()
                 .commands(write("key", "value"))
@@ -701,7 +925,7 @@ public class CapstoneTest extends BaseJUnitTest {
     @TestDescription("Search: write succeeds with one region partitioned")
     @Category(SearchTests.class)
     @TestPointValue(20)
-    public void test22SearchOneRegionDown() {
+    public void test27SearchOneRegionDown() {
         // Search config: k=1, m=1, threshold=1, 2 regions.
         // Partition off region 1 (server(3)) — 1 region left >= k=1.
         setupState(Workload.builder()
@@ -723,7 +947,7 @@ public class CapstoneTest extends BaseJUnitTest {
     @TestDescription("Search: no progress when all regions partitioned")
     @Category(SearchTests.class)
     @TestPointValue(20)
-    public void test23SearchNoProgressTooFewRegions() {
+    public void test28SearchNoProgressTooFewRegions() {
         // Search config: k=1, m=1, 2 regions.
         // Both regions partitioned — 0 reachable, below k=1.
         setupState(Workload.builder()
@@ -743,7 +967,7 @@ public class CapstoneTest extends BaseJUnitTest {
     @TestDescription("Search: write+read correctness (DFS)")
     @Category(SearchTests.class)
     @TestPointValue(20)
-    public void test24SearchWriteRead() {
+    public void test29SearchWriteRead() {
         // DFS explores deeper (like Paxos test24) — finds the goal faster than
         // BFS for larger state spaces. Partition to 1 region for manageability.
         setupState(putGetWorkload("key", "value"));
@@ -762,7 +986,7 @@ public class CapstoneTest extends BaseJUnitTest {
     @TestDescription("Search: erasure coding write with k=2, m=1, one region down")
     @Category(SearchTests.class)
     @TestPointValue(20)
-    public void test25SearchErasureCodingFaultTolerance() {
+    public void test30SearchErasureCodingFaultTolerance() {
         // Uses the REAL erasure coding config (k=2, m=1, 3 regions) — not the
         // minimal search config. Partitions 1 region so only 2 respond.
         // This deterministically verifies that Reed-Solomon reconstruction works

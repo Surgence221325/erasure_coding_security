@@ -157,6 +157,7 @@ public final class CapstoneClient extends Node implements Client {
         // Ignore transient errors — retry timer will re-send
         if ("AUTH_REQUIRED".equals(resp.error())) return;
         if ("INSUFFICIENT_REGIONS".equals(resp.error())) return;
+        if ("RECONFIGURING".equals(resp.error())) return;
 
         pendingResult  = new CapstoneWriteResult(resp.success(), resp.error());
         pendingCommand = null;
@@ -169,6 +170,7 @@ public final class CapstoneClient extends Node implements Client {
         // Ignore transient errors — retry timer will re-send
         if ("AUTH_REQUIRED".equals(resp.error())) return;
         if ("INSUFFICIENT_REGIONS".equals(resp.error())) return;
+        if ("RECONFIGURING".equals(resp.error())) return;
 
         pendingResult  = new CapstoneReadResult(resp.value(), resp.error());
         pendingCommand = null;

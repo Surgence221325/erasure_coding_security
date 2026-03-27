@@ -296,3 +296,29 @@ final class HeartbeatMsg implements Message {
 final class HeartbeatReply implements Message {
     // No payload needed — the reply itself confirms liveness.
 }
+
+// =============================================================================
+//  6. Dynamic Membership
+// =============================================================================
+
+/** Region requests to join the cluster. Includes HMAC proof of cluster secret. */
+@Data
+final class JoinRequest implements Message {
+    @NonNull private final byte[] hmac;  // HMAC(clusterSecret, regionAddress)
+
+    @Override public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof JoinRequest)) return false;
+        return Arrays.equals(hmac, ((JoinRequest) o).hmac);
+    }
+    @Override public int hashCode() {
+        return Arrays.hashCode(hmac);
+    }
+}
+
+/** Coordinator's response to a JoinRequest. */
+@Data
+final class JoinResult implements Message {
+    private final boolean success;
+    private final String  error;  // null on success
+}
