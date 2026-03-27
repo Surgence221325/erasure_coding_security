@@ -72,11 +72,7 @@ public class RegionalNode extends Node {
     }
 
     private static byte[] hmacSha256(byte[] key, byte[] data) {
-        try {
-            javax.crypto.Mac mac = javax.crypto.Mac.getInstance("HmacSHA256");
-            mac.init(new javax.crypto.spec.SecretKeySpec(key, "HmacSHA256"));
-            return mac.doFinal(data);
-        } catch (Exception e) { throw new RuntimeException("HMAC failed", e); }
+        return CryptoUtil.hmacSha256(key, data);
     }
 
     // -------------------------------------------------------------------------

@@ -5,8 +5,6 @@ import dslabs.framework.Client;
 import dslabs.framework.Command;
 import dslabs.framework.Node;
 import dslabs.framework.Result;
-import javax.crypto.Mac;
-import javax.crypto.spec.SecretKeySpec;
 import lombok.EqualsAndHashCode;
 import lombok.ToString;
 
@@ -210,11 +208,7 @@ public final class CapstoneClient extends Node implements Client {
     }
 
     private static byte[] hmacSha256(byte[] key, byte[] data) {
-        try {
-            Mac mac = Mac.getInstance("HmacSHA256");
-            mac.init(new SecretKeySpec(key, "HmacSHA256"));
-            return mac.doFinal(data);
-        } catch (Exception e) { throw new RuntimeException("HMAC failed", e); }
+        return CryptoUtil.hmacSha256(key, data);
     }
 
     private void log(String msg) {

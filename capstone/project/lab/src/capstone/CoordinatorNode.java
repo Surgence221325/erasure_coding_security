@@ -9,7 +9,6 @@ import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 import javax.crypto.Cipher;
-import javax.crypto.Mac;
 import javax.crypto.spec.IvParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 import lombok.EqualsAndHashCode;
@@ -117,20 +116,26 @@ public class CoordinatorNode extends Node {
     // Since each client processes commands sequentially with monotonically
     // increasing seqNums, we only need to store the LATEST (seqNum, response)
     // per client.  Any replay with seqNum <= lastProcessed is stale.
+    // Reads are idempotent and don't need dedup — duplicate reads produce the
+    // same result without state changes.
     // clientId -> (latestSeqNum, cachedResponse)
     private Map<String, DedupEntry> writeDedup;
 
-    // --- Region liveness (region address -> last heartbeat reply time ms) ---
-    // A region is considered dead if no heartbeat reply in REGION_DEAD_MILLIS.
-    // Dead regions are skipped in fan-out to save network traffic.
-    private static final long REGION_DEAD_MILLIS = 2 * HeartbeatTimer.HEARTBEAT_MILLIS; // 1000ms
-    private Map<Address, Long> lastHeartbeat;
+    // --- Region liveness (logical heartbeat counter, fully deterministic) ---
+    // Each heartbeat cycle increments a region's missed count. A heartbeat reply
+    // resets it to 0. A region is considered dead if it has missed >= DEAD_THRESHOLD
+    // consecutive heartbeats. This avoids System.currentTimeMillis() which would
+    // break the framework's deterministic model checking.
+    private static final int HEARTBEAT_DEAD_THRESHOLD = 2;
+    private Map<Address, Integer> missedHeartbeats;
 
     // --- Authentication state ---
     // clientId -> nonce (pending challenge-response)
     private Map<String, byte[]> pendingAuths;
     // sessionToken -> clientId (validated sessions)
     private Map<String, String> validSessions;
+    // clientId -> sessionToken (reverse lookup, O(1) instead of O(n) scan)
+    private Map<String, String> clientToToken;
 
     // --- Per-key ownership (key -> owning clientId) ---
     private Map<String, String> keyOwner;
@@ -177,16 +182,16 @@ public class CoordinatorNode extends Node {
         pendingWrites   = new HashMap<>();
         pendingReads    = new HashMap<>();
         writeDedup      = new HashMap<>();
-        lastHeartbeat   = new HashMap<>();
+        missedHeartbeats = new HashMap<>();
         pendingAuths    = new HashMap<>();
         validSessions   = new HashMap<>();
+        clientToToken   = new HashMap<>();
         keyOwner        = new HashMap<>();
         reconfiguring   = false;
         pendingJoinRegion = null;
 
-        // Assume all regions alive at startup; they'll confirm via heartbeat.
-        long now = System.currentTimeMillis();
-        for (Address r : regions) lastHeartbeat.put(r, now);
+        // Assume all regions alive at startup (missed count = 0).
+        for (Address r : regions) missedHeartbeats.put(r, 0);
 
         // Start the recurring heartbeat timer (disabled during search tests
         // to prevent infinite BFS state expansion).
@@ -261,6 +266,7 @@ public class CoordinatorNode extends Node {
         String token = sb.toString();
 
         validSessions.put(token, resp.clientId());
+        clientToToken.put(resp.clientId(), token);
         pendingAuths.remove(resp.clientId());
         log("*** Authenticated " + resp.clientId() + " token=" + token + " ***");
         send(new AuthResultMsg(resp.clientId(), token, true, null), sender);
@@ -275,12 +281,9 @@ public class CoordinatorNode extends Node {
         return validSessions.get(sessionToken);
     }
 
-    /** Reverse lookup: find the session token for a given clientId, or null. */
+    /** Reverse lookup: find the session token for a given clientId, or null. O(1). */
     private String getSessionForClient(String clientId) {
-        for (Map.Entry<String, String> e : validSessions.entrySet()) {
-            if (e.getValue().equals(clientId)) return e.getKey();
-        }
-        return null;
+        return clientToToken.get(clientId);
     }
 
     // =========================================================================
@@ -288,9 +291,9 @@ public class CoordinatorNode extends Node {
     // =========================================================================
 
     private boolean isRegionAlive(Address region) {
-        Long last = lastHeartbeat.get(region);
-        if (last == null) return false;
-        return (System.currentTimeMillis() - last) < REGION_DEAD_MILLIS;
+        Integer missed = missedHeartbeats.get(region);
+        if (missed == null) return false;
+        return missed < HEARTBEAT_DEAD_THRESHOLD;
     }
 
     private int countAliveRegions() {
@@ -709,12 +712,17 @@ public class CoordinatorNode extends Node {
      * The coordinator uses heartbeat replies to track region liveness.
      */
     private void onHeartbeatTimer(HeartbeatTimer t) {
-        for (Address region : regions) send(new HeartbeatMsg(), region);
+        // Increment missed count for every region, then ping them.
+        // Regions that reply will reset their count in handleHeartbeatReply.
+        for (Address region : regions) {
+            missedHeartbeats.merge(region, 1, Integer::sum);
+            send(new HeartbeatMsg(), region);
+        }
         set(t, HeartbeatTimer.HEARTBEAT_MILLIS);  // re-arm
     }
 
     private void handleHeartbeatReply(HeartbeatReply reply, Address sender) {
-        lastHeartbeat.put(sender, System.currentTimeMillis());
+        missedHeartbeats.put(sender, 0);  // alive — reset counter
         log("Heartbeat reply from " + sender);
     }
 
@@ -774,7 +782,7 @@ public class CoordinatorNode extends Node {
         regions.add(newRegion);
         m = m + 1;
         erasureCoder = new ErasureCoder(k, m);
-        lastHeartbeat.put(newRegion, System.currentTimeMillis());
+        missedHeartbeats.put(newRegion, 0);
         reconfiguring     = false;
         pendingJoinRegion = null;
 
@@ -863,16 +871,8 @@ public class CoordinatorNode extends Node {
         } catch (Exception e) { throw new RuntimeException("AES decrypt failed", e); }
     }
 
-    // =========================================================================
-    //  HMAC-SHA256
-    // =========================================================================
-
     private static byte[] hmacSha256(byte[] key, byte[] data) {
-        try {
-            Mac mac = Mac.getInstance("HmacSHA256");
-            mac.init(new SecretKeySpec(key, "HmacSHA256"));
-            return mac.doFinal(data);
-        } catch (Exception e) { throw new RuntimeException("HMAC failed", e); }
+        return CryptoUtil.hmacSha256(key, data);
     }
 
     // =========================================================================
