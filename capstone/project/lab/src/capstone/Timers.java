@@ -13,15 +13,32 @@ import lombok.Data;
  * The framework delivers a timer by calling the handler even if the node's
  * state has changed since the timer was set.  Each handler should check
  * whether the timer is still relevant before acting on it.
+ *
+ * Client retry timers use exponential backoff: the interval doubles each
+ * retry up to a cap (MAX_BACKOFF_MILLIS).  This reduces wasted messages
+ * during sustained failures while still recovering quickly from transient ones.
  */
 
 /**
  * Client auth retry timer.
  * If the client hasn't received an AuthResult, it re-sends AuthRequest.
+ * Uses exponential backoff: 100 → 200 → 400 → ... → 2000ms cap.
  */
 @Data
 final class AuthRetryTimer implements Timer {
-    static final int AUTH_RETRY_MILLIS = 100;
+    static final int INITIAL_MILLIS     = 100;
+    static final int MAX_BACKOFF_MILLIS = 2000;
+    private final int backoffMillis;
+
+    AuthRetryTimer() { this.backoffMillis = INITIAL_MILLIS; }
+    AuthRetryTimer(int backoffMillis) {
+        this.backoffMillis = backoffMillis;
+    }
+
+    /** Return a new timer with doubled backoff (capped). */
+    AuthRetryTimer nextBackoff() {
+        return new AuthRetryTimer(Math.min(backoffMillis * 2, MAX_BACKOFF_MILLIS));
+    }
 }
 
 /**
@@ -29,11 +46,29 @@ final class AuthRetryTimer implements Timer {
  * If the client hasn't received a response for its pending request, it
  * re-broadcasts the request.  Carries the sequence number so we can
  * ignore stale timer fires from a previous request.
+ * Uses exponential backoff: 100 → 200 → 400 → ... → 2000ms cap.
  */
 @Data
 final class ClientRetryTimer implements Timer {
-    static final int CLIENT_RETRY_MILLIS = 100;
+    static final int INITIAL_MILLIS     = 100;
+    static final int MAX_BACKOFF_MILLIS = 2000;
     private final int sequenceNum;
+    private final int backoffMillis;
+
+    ClientRetryTimer(int sequenceNum) {
+        this.sequenceNum   = sequenceNum;
+        this.backoffMillis = INITIAL_MILLIS;
+    }
+    ClientRetryTimer(int sequenceNum, int backoffMillis) {
+        this.sequenceNum   = sequenceNum;
+        this.backoffMillis = backoffMillis;
+    }
+
+    /** Return a new timer with doubled backoff (capped). */
+    ClientRetryTimer nextBackoff() {
+        return new ClientRetryTimer(sequenceNum,
+                Math.min(backoffMillis * 2, MAX_BACKOFF_MILLIS));
+    }
 }
 
 /**

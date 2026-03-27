@@ -567,10 +567,59 @@ public class CapstoneTest extends BaseJUnitTest {
     }
 
     @Test(timeout = 10 * 1000)
+    @TestDescription("Corrupted fragment detected by checksum, read still succeeds")
+    @Category(RunTests.class)
+    @TestPointValue(10)
+    public void test19CorruptedFragmentDetected() throws InterruptedException {
+        // One region corrupts fragments on read (flips a byte).
+        // The coordinator's SHA-256 checksum verification rejects it.
+        // With k=2, m=1: the corrupted fragment is discarded, and the
+        // remaining 2 valid fragments are enough to reconstruct.
+        // This proves: idempotent acks let corruption through at write time,
+        // but checksums catch it at read time.
+        Address coordinator = server(1);
+        Address[] regions = new Address[NUM_REGIONS];
+        for (int i = 0; i < NUM_REGIONS; i++) {
+            regions[i] = server(i + 2);
+        }
+
+        StateGeneratorBuilder b = StateGenerator.builder();
+        b.serverSupplier(a -> {
+            if (a.equals(coordinator)) {
+                return new CoordinatorNode(a, regions, K, M, KEY_THRESHOLD, CLIENT_SECRETS);
+            } else if (a.equals(server(4))) {
+                // Region 2 (server(4)) corrupts fragments on read
+                return new RegionalNode(a, true);
+            } else {
+                return new RegionalNode(a);
+            }
+        });
+        b.clientSupplier(a -> new CapstoneClient(a, coordinator, CLIENT_SECRETS.get(a.toString())));
+        b.workloadSupplier(emptyWorkload());
+
+        StateGenerator sg = b.build();
+        runState = new RunState(sg);
+        runState.addServer(server(1));
+        for (int i = 0; i < NUM_REGIONS; i++) {
+            runState.addServer(server(i + 2));
+        }
+
+        Client client = runState.addClient(client(1));
+        runState.start(runSettings);
+
+        // Write succeeds (all 3 regions store valid fragments)
+        sendCommandAndCheck(client, write("key", "secret-data"), writeOk());
+
+        // Read succeeds despite region 2 returning corrupted fragment —
+        // coordinator detects checksum mismatch, uses regions 0 and 1
+        sendCommandAndCheck(client, read("key"), readResult("secret-data"));
+    }
+
+    @Test(timeout = 10 * 1000)
     @TestDescription("Client with wrong credentials cannot write")
     @Category(RunTests.class)
     @TestPointValue(10)
-    public void test19WrongCredentialsRejected() throws InterruptedException {
+    public void test20WrongCredentialsRejected() throws InterruptedException {
         // Build a custom state where client(2) has a WRONG secret.
         // The coordinator has the real secret; client(2) has all-zeros.
         // The HMAC won't match, auth fails, client stays unauthenticated.
@@ -632,7 +681,7 @@ public class CapstoneTest extends BaseJUnitTest {
     @TestDescription("Search: single client write completes under all orderings")
     @Category(SearchTests.class)
     @TestPointValue(20)
-    public void test20SearchBasicWrite() {
+    public void test21SearchBasicWrite() {
         // Single write only (not put+get) to keep state space manageable
         setupState(Workload.builder()
                 .commands(write("key", "value"))
@@ -652,7 +701,7 @@ public class CapstoneTest extends BaseJUnitTest {
     @TestDescription("Search: write succeeds with one region partitioned")
     @Category(SearchTests.class)
     @TestPointValue(20)
-    public void test21SearchOneRegionDown() {
+    public void test22SearchOneRegionDown() {
         // Search config: k=1, m=1, threshold=1, 2 regions.
         // Partition off region 1 (server(3)) — 1 region left >= k=1.
         setupState(Workload.builder()
@@ -674,7 +723,7 @@ public class CapstoneTest extends BaseJUnitTest {
     @TestDescription("Search: no progress when all regions partitioned")
     @Category(SearchTests.class)
     @TestPointValue(20)
-    public void test22SearchNoProgressTooFewRegions() {
+    public void test23SearchNoProgressTooFewRegions() {
         // Search config: k=1, m=1, 2 regions.
         // Both regions partitioned — 0 reachable, below k=1.
         setupState(Workload.builder()
@@ -694,7 +743,7 @@ public class CapstoneTest extends BaseJUnitTest {
     @TestDescription("Search: write+read correctness (DFS)")
     @Category(SearchTests.class)
     @TestPointValue(20)
-    public void test23SearchWriteRead() {
+    public void test24SearchWriteRead() {
         // DFS explores deeper (like Paxos test24) — finds the goal faster than
         // BFS for larger state spaces. Partition to 1 region for manageability.
         setupState(putGetWorkload("key", "value"));
@@ -713,7 +762,7 @@ public class CapstoneTest extends BaseJUnitTest {
     @TestDescription("Search: erasure coding write with k=2, m=1, one region down")
     @Category(SearchTests.class)
     @TestPointValue(20)
-    public void test24SearchErasureCodingFaultTolerance() {
+    public void test25SearchErasureCodingFaultTolerance() {
         // Uses the REAL erasure coding config (k=2, m=1, 3 regions) — not the
         // minimal search config. Partitions 1 region so only 2 respond.
         // This deterministically verifies that Reed-Solomon reconstruction works

@@ -34,8 +34,17 @@ public class RegionalNode extends Node {
     // key share storage:  objectKey -> (version -> share bytes)
     private Map<String, Map<Integer, byte[]>> keyShares;
 
+    // If true, flip a byte in every fragment returned on read.
+    // Used in corruption injection tests to verify coordinator checksum detection.
+    private final boolean corruptFragmentsOnRead;
+
     public RegionalNode(Address address) {
+        this(address, false);
+    }
+
+    public RegionalNode(Address address, boolean corruptFragmentsOnRead) {
         super(address);
+        this.corruptFragmentsOnRead = corruptFragmentsOnRead;
     }
 
     @Override
@@ -120,8 +129,13 @@ public class RegionalNode extends Node {
             fragment = Arrays.copyOf(stored, stored.length);
         }
 
-        if (fragment == null)
+        if (fragment == null) {
             log("Fragment not found for key=" + req.key() + " v=" + req.version());
+        } else if (corruptFragmentsOnRead) {
+            // Flip a byte to simulate storage corruption or a malicious region
+            fragment[0] = (byte) (fragment[0] ^ 0xFF);
+            log("*** CORRUPTING fragment for key=" + req.key() + " v=" + req.version() + " ***");
+        }
 
         send(new FragmentReadReply(req.key(), req.version(), req.regionIndex(), fragment), sender);
     }

@@ -67,8 +67,9 @@ public final class CapstoneClient extends Node implements Client {
         sessionToken   = null;
 
         // Initiate authentication handshake
+        AuthRetryTimer authTimer = new AuthRetryTimer();
         send(new AuthRequest(address().toString()), coordinator);
-        set(new AuthRetryTimer(), AuthRetryTimer.AUTH_RETRY_MILLIS);
+        set(authTimer, authTimer.backoffMillis());
     }
 
     // =========================================================================
@@ -91,7 +92,8 @@ public final class CapstoneClient extends Node implements Client {
         pendingSeq     = nextSeq++;
 
         sendPending();
-        set(new ClientRetryTimer(pendingSeq), ClientRetryTimer.CLIENT_RETRY_MILLIS);
+        ClientRetryTimer retryTimer = new ClientRetryTimer(pendingSeq);
+        set(retryTimer, retryTimer.backoffMillis());
     }
 
     @Override
@@ -139,9 +141,10 @@ public final class CapstoneClient extends Node implements Client {
 
     private synchronized void onAuthRetryTimer(AuthRetryTimer t) {
         if (authenticated) return;
-        log("Retrying auth");
+        log("Retrying auth (backoff=" + t.backoffMillis() + "ms)");
         send(new AuthRequest(address().toString()), coordinator);
-        set(t, AuthRetryTimer.AUTH_RETRY_MILLIS);
+        AuthRetryTimer next = t.nextBackoff();
+        set(next, next.backoffMillis());
     }
 
     // =========================================================================
@@ -179,9 +182,10 @@ public final class CapstoneClient extends Node implements Client {
     private synchronized void onClientRetryTimer(ClientRetryTimer t) {
         if (pendingCommand == null || t.sequenceNum() != pendingSeq) return;
 
-        log("Retrying seq=" + pendingSeq);
+        log("Retrying seq=" + pendingSeq + " (backoff=" + t.backoffMillis() + "ms)");
         sendPending();
-        set(t, ClientRetryTimer.CLIENT_RETRY_MILLIS);
+        ClientRetryTimer next = t.nextBackoff();
+        set(next, next.backoffMillis());
     }
 
     // =========================================================================
