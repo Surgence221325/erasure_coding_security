@@ -1151,9 +1151,16 @@ public class CapstoneTest extends BaseJUnitTest {
         // Read returns the latest version (GC didn't break anything)
         sendCommandAndCheck(client, read("gc-key"), readResult("version-" + numVersions));
 
+        // Verify GC: coordinator should have exactly 1 version, not 20
+        CoordinatorNode coord = (CoordinatorNode) runState.server(server(1));
+        assertEquals("GC should leave exactly 1 version", 1, coord.getVersionCount("gc-key"));
+
         // Write a second key to verify the system is healthy after GC
         sendCommandAndCheck(client, write("gc-key-2", "fresh"), writeOk());
         sendCommandAndCheck(client, read("gc-key-2"), readResult("fresh"));
+
+        // Total versions: 1 for gc-key + 1 for gc-key-2 = 2
+        assertEquals("Total versions should be 2", 2, coord.getTotalVersionCount());
     }
 
     @Test(timeout = 10 * 1000)
@@ -1189,5 +1196,99 @@ public class CapstoneTest extends BaseJUnitTest {
 
         sendCommandAndCheck(client, write("fail-key", "success"), writeOk());
         sendCommandAndCheck(client, read("fail-key"), readResult("success"));
+
+        // Verify: coordinator should have exactly 1 version (uncommitted was GC'd)
+        CoordinatorNode coord = (CoordinatorNode) runState.server(server(1));
+        assertEquals("Uncommitted version should be GC'd", 1, coord.getVersionCount("fail-key"));
+    }
+
+    @Test(timeout = 15 * 1000)
+    @TestDescription("Message count increases after dynamic join (more regions)")
+    @Category(RunTests.class)
+    @TestPointValue(10)
+    public void test35MessageCountAfterJoin() throws InterruptedException {
+        // With 3 regions: ~14 msgs/op. After 4th region joins (k=2, m=2):
+        // each write sends to 4 regions (4 FragmentWrite + 4 KeyShareWrite + 4+4 acks)
+        // + request + response = ~18 msgs/op. Measures the cost of dynamic membership.
+        setupDynamicState(emptyWorkload());
+        Client client = runState.addClient(client(1));
+        runState.start(runSettings);
+
+        // 4th region joins
+        runState.addServer(server(5));
+        Thread.sleep(500);
+
+        // Verify join happened
+        CoordinatorNode coord = (CoordinatorNode) runState.server(server(1));
+        assertEquals("Should have 4 regions after join", 4, coord.getRegionCount());
+
+        // Let heartbeats and auth settle
+        Thread.sleep(500);
+
+        // Snapshot before
+        long msgsBefore = 0;
+        for (Address s : runState.serverAddresses()) {
+            msgsBefore += runState.network().numMessagesSentTo(s);
+        }
+        msgsBefore += runState.network().numMessagesSentTo(client(1));
+
+        // Run 10 write+read pairs with 4 regions
+        int nRounds = 10;
+        for (int i = 0; i < nRounds; i++) {
+            sendCommandAndCheck(client, write("jk-" + i, "jv-" + i), writeOk());
+            sendCommandAndCheck(client, read("jk-" + i), readResult("jv-" + i));
+        }
+
+        // Snapshot after
+        long msgsAfter = 0;
+        for (Address s : runState.serverAddresses()) {
+            msgsAfter += runState.network().numMessagesSentTo(s);
+        }
+        msgsAfter += runState.network().numMessagesSentTo(client(1));
+
+        long totalMessages = msgsAfter - msgsBefore;
+        double msgsPerOp = ((double) totalMessages) / (nRounds * 2);
+
+        // Expected: ~18 msgs/op with 4 regions (was ~14 with 3)
+        // 1 request + 4×2 region writes + 4×2 acks + 1 response = 18
+        System.out.println("After join: total messages=" + totalMessages
+            + ", per operation=" + String.format("%.1f", msgsPerOp)
+            + " (expected ~18 with 4 regions, was ~14 with 3)");
+
+        assertTrue("Msgs/op should be >= 14 (more regions = more messages)",
+                   msgsPerOp >= 14);
+        assertTrue("Msgs/op should be <= 24 (bounded overhead)",
+                   msgsPerOp <= 24);
+    }
+
+    @Test(timeout = 15 * 1000)
+    @TestDescription("GC works correctly after dynamic join (mixed version configs)")
+    @Category(RunTests.class)
+    @TestPointValue(10)
+    public void test36GCAfterDynamicJoin() throws InterruptedException {
+        // Write key with 3 regions (v1: k=2, m=1), join 4th region,
+        // overwrite key with 4 regions (v2: k=2, m=2). GC should delete v1
+        // (which has a DIFFERENT k/m config than v2). Verify coordinator
+        // only has 1 version and the read uses the new config correctly.
+        setupDynamicState(emptyWorkload());
+        Client client = runState.addClient(client(1));
+        runState.start(runSettings);
+
+        // Write v1 with 3 regions
+        sendCommandAndCheck(client, write("mixed-key", "old-config"), writeOk());
+
+        // Join 4th region
+        runState.addServer(server(5));
+        Thread.sleep(500);
+
+        // Overwrite with 4 regions — GC should delete v1 (different k/m)
+        sendCommandAndCheck(client, write("mixed-key", "new-config"), writeOk());
+
+        // Verify: only 1 version remains despite different configs
+        CoordinatorNode coord = (CoordinatorNode) runState.server(server(1));
+        assertEquals("GC should clean old config version", 1, coord.getVersionCount("mixed-key"));
+
+        // Read returns the new version
+        sendCommandAndCheck(client, read("mixed-key"), readResult("new-config"));
     }
 }

@@ -1032,6 +1032,30 @@ public class CoordinatorNode extends Node {
     }
 
     // =========================================================================
+    //  Observability (read-only diagnostics for tests)
+    // =========================================================================
+
+    /** Returns the number of versions stored for a key (for GC verification). */
+    public int getVersionCount(String key) {
+        Map<Integer, VersionMetadata> versions = allVersions.get(key);
+        return (versions != null) ? versions.size() : 0;
+    }
+
+    /** Returns the total number of versions across all keys. */
+    public int getTotalVersionCount() {
+        int total = 0;
+        for (Map<Integer, VersionMetadata> v : allVersions.values()) {
+            total += v.size();
+        }
+        return total;
+    }
+
+    /** Returns the current number of regions. */
+    public int getRegionCount() {
+        return regions.size();
+    }
+
+    // =========================================================================
     //  Utility
     // =========================================================================
 
