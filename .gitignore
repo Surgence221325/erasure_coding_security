@@ -21,3 +21,4 @@ __pycache__/
 .venv/
 uv.lock
 
+capstone/project/ai_instructions.md

@@ -1,0 +1,162 @@
+package dslabs.capstone;
+
+import dslabs.framework.Address;
+import dslabs.framework.Node;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Map;
+import lombok.EqualsAndHashCode;
+import lombok.ToString;
+
+/**
+ * A regional node in the distributed KV store.
+ *
+ * Extends dslabs.framework.Node — message handlers are named handleFoo(Foo, Address)
+ * and are dispatched via reflection, exactly as in the Paxos lab.
+ *
+ * Responsibilities:
+ *   1. Fragment store: durably holds one ciphertext fragment per (key, version).
+ *   2. Key-share holder: durably holds one Shamir share of the AES key per (key, version).
+ *
+ * The region knows nothing about other regions.  It cannot reconstruct the full
+ * ciphertext or the full AES key alone.
+ *
+ * Region indices are learned per-message (from FragmentWrite.regionIndex), so a
+ * single RegionalNode class serves all positions in the erasure coding scheme.
+ */
+@ToString(callSuper = true)
+@EqualsAndHashCode(callSuper = true)
+public class RegionalNode extends Node {
+
+    // fragment storage:   objectKey -> (version -> fragment bytes)
+    private Map<String, Map<Integer, byte[]>> fragments;
+
+    // key share storage:  objectKey -> (version -> share bytes)
+    private Map<String, Map<Integer, byte[]>> keyShares;
+
+    public RegionalNode(Address address) {
+        super(address);
+    }
+
+    @Override
+    public void init() {
+        fragments = new HashMap<>();
+        keyShares = new HashMap<>();
+        // Regions don't set any timers on init — they're passive responders.
+    }
+
+    // -------------------------------------------------------------------------
+    //  Write handlers
+    // -------------------------------------------------------------------------
+
+    /**
+     * Store the ciphertext fragment for this (key, version).
+     *
+     * Duplicate writes for the same version are rejected.  The coordinator
+     * only sends one FragmentWrite per region per version, so a duplicate
+     * arriving here indicates either a retransmission (message duplication)
+     * or a logic error.  Rejecting is safe: the coordinator won't count this
+     * ack toward its threshold.
+     */
+    private void handleFragmentWrite(FragmentWrite m, Address sender) {
+        log("Received " + m);
+
+        Map<Integer, byte[]> byVersion =
+            fragments.computeIfAbsent(m.key(), k -> new HashMap<>());
+
+        if (byVersion.containsKey(m.version())) {
+            log("Rejecting duplicate FragmentWrite for key=" + m.key() + " v=" + m.version());
+            send(new FragmentAck(m.key(), m.version(), m.regionIndex(), false), sender);
+            return;
+        }
+
+        byVersion.put(m.version(), Arrays.copyOf(m.fragment(), m.fragment().length));
+        log("Stored fragment for key=" + m.key() + " v=" + m.version()
+            + " (" + m.fragment().length + " bytes)");
+
+        send(new FragmentAck(m.key(), m.version(), m.regionIndex(), true), sender);
+    }
+
+    /**
+     * Store the Shamir key share for this (key, version).
+     * Same rejection logic as handleFragmentWrite.
+     */
+    private void handleKeyShareWrite(KeyShareWrite m, Address sender) {
+        log("Received " + m);
+
+        Map<Integer, byte[]> byVersion =
+            keyShares.computeIfAbsent(m.key(), k -> new HashMap<>());
+
+        if (byVersion.containsKey(m.version())) {
+            log("Rejecting duplicate KeyShareWrite for key=" + m.key() + " v=" + m.version());
+            send(new KeyShareAck(m.key(), m.version(), m.regionIndex(), false), sender);
+            return;
+        }
+
+        byVersion.put(m.version(), Arrays.copyOf(m.keyShare(), m.keyShare().length));
+        log("Stored key share for key=" + m.key() + " v=" + m.version());
+
+        send(new KeyShareAck(m.key(), m.version(), m.regionIndex(), true), sender);
+    }
+
+    // -------------------------------------------------------------------------
+    //  Read handlers
+    // -------------------------------------------------------------------------
+
+    /**
+     * Return the stored fragment for (key, version).
+     * Replies with fragment=null if not found (stale version request, or
+     * region was down when the write happened).
+     */
+    private void handleFragmentReadRequest(FragmentReadRequest req, Address sender) {
+        log("Received " + req);
+
+        byte[] fragment = null;
+        Map<Integer, byte[]> byVersion = fragments.get(req.key());
+        if (byVersion != null && byVersion.containsKey(req.version())) {
+            byte[] stored = byVersion.get(req.version());
+            fragment = Arrays.copyOf(stored, stored.length);
+        }
+
+        if (fragment == null)
+            log("Fragment not found for key=" + req.key() + " v=" + req.version());
+
+        send(new FragmentReadReply(req.key(), req.version(), req.regionIndex(), fragment), sender);
+    }
+
+    /**
+     * Return the stored key share for (key, version).
+     */
+    private void handleKeyShareReadRequest(KeyShareReadRequest req, Address sender) {
+        log("Received " + req);
+
+        byte[] share = null;
+        Map<Integer, byte[]> byVersion = keyShares.get(req.key());
+        if (byVersion != null && byVersion.containsKey(req.version())) {
+            byte[] stored = byVersion.get(req.version());
+            share = Arrays.copyOf(stored, stored.length);
+        }
+
+        if (share == null)
+            log("Key share not found for key=" + req.key() + " v=" + req.version());
+
+        send(new KeyShareReadReply(req.key(), req.version(), req.regionIndex(), share), sender);
+    }
+
+    // -------------------------------------------------------------------------
+    //  Heartbeat
+    // -------------------------------------------------------------------------
+
+    private void handleHeartbeatMsg(HeartbeatMsg m, Address sender) {
+        // Just reply — the reply itself is what the coordinator needs.
+        send(new HeartbeatReply(), sender);
+    }
+
+    // -------------------------------------------------------------------------
+    //  Utility
+    // -------------------------------------------------------------------------
+
+    private void log(String msg) {
+        System.out.println("[" + address() + "] " + msg);
+    }
+}
