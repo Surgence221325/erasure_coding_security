@@ -59,3 +59,45 @@ Goal: Capstone Design
 Prompt Summary: I was given an idea by the Professor on how to "spice up" a distributed key value store. I chose to use erasure coding to ensure confidentiality of stored objects. ChatGPT was helpful in iteratively helping me make decisions about the design and understand intricacies regarding this concept I was unaware of.
 Decision: (k, m) erasure coding scheme, and key-share threshold encryption as core of distributed decision
 Unknowns: alternatives to this scheme? any ways to improve latency/tradeoffs.
+
+Goal: Implement capstone source code
+Prompt Summary: Gave AI (Claude) the design doc and dslabs framework context. It helped implement CoordinatorNode, RegionalNode, CapstoneClient — translating the protocol design into dslabs framework message handlers.
+Key Output: Working implementation of write path (encrypt → erasure code → Shamir split → distribute) and read path (gather → verify → reconstruct → decrypt).
+Decision: Adopted the implementation, iteratively fixed bugs discovered through testing.
+Evidence Link: capstone/project/lab/src/capstone/
+Unknowns: Whether the protocol was correct under all message orderings (later verified by search tests).
+
+Goal: Build test suite modeled on dp2 PaxosTest
+Prompt Summary: Used dp2's PaxosTest.java as reference. AI helped structure tests across categories (correctness, fault tolerance, multi-client, auth, search). Discussed which Paxos patterns apply to our system and which don't.
+Key Output: 36 tests across 9 categories including deterministic BFS/DFS search tests.
+Decision: Adopted run + search test dual approach. Search tests use smaller config (k=1,m=1) for tractable state space.
+Evidence Link: capstone/project/lab/tst/dslabs.capstone/CapstoneTest.java
+Unknowns: Whether search test configuration is representative enough of real config.
+
+Goal: Add client authentication
+Prompt Summary: Discovered mid-implementation that any node could read any key — no auth existed. Discussed options (pre-shared token, challenge-response, per-request HMAC) with AI. Chose challenge-response HMAC with session tokens.
+Key Output: HMAC-SHA256 handshake where shared secret never travels over the wire. Per-key ownership (first writer wins).
+Decision: Adopted challenge-response + ownership. This was a reactive discovery, not planned — the design doc said "clients are untrusted" but we didn't implement auth until we saw the vulnerability.
+Evidence Link: Auth messages in Messages.java, handlers in CoordinatorNode/CapstoneClient
+Unknowns: No token expiry mechanism. Permanent ownership means decommissioned clients lock their keys.
+
+Goal: Add deterministic search tests (BFS/DFS model checking)
+Prompt Summary: AI helped adapt BFS/DFS patterns from PaxosTest. Discovered that heartbeat timers cause infinite state expansion in BFS. Found auth nonce race condition only visible under exhaustive ordering exploration.
+Key Output: Nonce race bug — auth retry overwrites pending nonce, invalidating in-flight HMAC. Fixed by making handleAuthRequest idempotent.
+Decision: Disabled timers in search, used smaller config, added proactive re-send on auth completion. The nonce race was the strongest "system pushed back" moment.
+Evidence Link: Search tests (test26-30), auth nonce fix in CoordinatorNode
+Unknowns: Whether timer-disabled search tests miss timer-dependent bugs.
+
+Goal: Implement dynamic region membership
+Prompt Summary: Discussed design extensively with AI — whether to change k or m on join, how old keys interact, how to coordinate the join without blocking forever. Evaluated alternatives (re-encoding old data, region removal, concurrent joins).
+Key Output: Add-only join protocol with reconfiguration pause, per-version metadata for backward compatibility, fire-and-forget approach.
+Decision: k stays fixed, m increases. Old keys keep original encoding. No re-encoding, no removal. Reconfiguration timeout (2s) prevents indefinite write rejection.
+Evidence Link: JoinRequest handling in CoordinatorNode, dynamic membership tests (test22-25)
+Unknowns: Whether 2s reconfig timeout is sufficient for production. Per-key encoding creates long-tail maintenance burden.
+
+Goal: Implement garbage collection
+Prompt Summary: Discussed GC approaches with AI — confirmed deletes (blocks on downed regions), region-initiated reconciliation (complex), heartbeat piggyback (slow scan), fire-and-forget (simple, harmless orphans). Chose fire-and-forget.
+Key Output: On commit, delete old versions locally + send DeleteVersionData to regions. On write timeout, delete uncommitted version. Orphaned region data is unreachable without coordinator metadata.
+Decision: Fire-and-forget. Production would add periodic reconciliation. Verified via getVersionCount() — 20 overwrites → 1 version retained.
+Evidence Link: GC in CoordinatorNode (gcOldVersions, gcUncommittedVersion), tests 33-36
+Unknowns: Orphaned fragments on regions that miss delete messages. Harmless but wastes storage.
