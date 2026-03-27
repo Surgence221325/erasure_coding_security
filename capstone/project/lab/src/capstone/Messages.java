@@ -322,3 +322,19 @@ final class JoinResult implements Message {
     private final boolean success;
     private final String  error;  // null on success
 }
+
+// =============================================================================
+//  7. Garbage Collection
+// =============================================================================
+
+/**
+ * Coordinator tells a region to delete stored fragment and key share for a
+ * specific (key, version). Fire-and-forget: no ack required. If the message
+ * is lost, the region keeps orphaned data (harmless — unreachable without
+ * coordinator metadata). Idempotent: deleting already-deleted data is a no-op.
+ */
+@Data
+final class DeleteVersionData implements Message {
+    @NonNull private final String key;
+    private final int             version;
+}

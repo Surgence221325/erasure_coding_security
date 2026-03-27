@@ -198,6 +198,33 @@ public class RegionalNode extends Node {
     }
 
     // -------------------------------------------------------------------------
+    //  Garbage collection
+    // -------------------------------------------------------------------------
+
+    private void handleDeleteVersionData(DeleteVersionData req, Address sender) {
+        // Idempotent: deleting non-existent data is a no-op.
+        boolean deletedFragment = false;
+        boolean deletedShare = false;
+
+        Map<Integer, byte[]> fragByVersion = fragments.get(req.key());
+        if (fragByVersion != null) {
+            deletedFragment = fragByVersion.remove(req.version()) != null;
+            if (fragByVersion.isEmpty()) fragments.remove(req.key());
+        }
+
+        Map<Integer, byte[]> shareByVersion = keyShares.get(req.key());
+        if (shareByVersion != null) {
+            deletedShare = shareByVersion.remove(req.version()) != null;
+            if (shareByVersion.isEmpty()) keyShares.remove(req.key());
+        }
+
+        if (deletedFragment || deletedShare) {
+            log("GC: deleted v=" + req.version() + " for key=" + req.key()
+                + " (fragment=" + deletedFragment + ", share=" + deletedShare + ")");
+        }
+    }
+
+    // -------------------------------------------------------------------------
     //  Utility
     // -------------------------------------------------------------------------
 

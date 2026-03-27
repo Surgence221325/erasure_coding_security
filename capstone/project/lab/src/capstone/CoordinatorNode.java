@@ -514,6 +514,12 @@ public class CoordinatorNode extends Node {
 
         pendingWrites.remove(pending.key);
 
+        // GC: delete all old versions of this key (previous committed + any
+        // orphaned uncommitted). Safe because single-threaded: no in-flight
+        // read can reference an old version (the same client had to wait for
+        // its read to complete before sending this write).
+        gcOldVersions(pending.key, pending.version);
+
         // If reconfiguring and all writes drained, apply the pending join
         if (reconfiguring && pendingWrites.isEmpty()) {
             applyJoin();
@@ -840,8 +846,9 @@ public class CoordinatorNode extends Node {
             false, "WRITE_TIMEOUT: insufficient acks");
         send(resp, pending.clientSender);
         pendingWrites.remove(t.key());
-        // Note: the partial version remains in allVersions but is uncommitted,
-        // so it will never be visible to readers.  It can be GC'd later.
+
+        // GC: clean up the failed uncommitted version immediately
+        gcUncommittedVersion(t.key(), t.version());
 
         // If reconfiguring and all writes drained, apply the pending join
         if (reconfiguring && pendingWrites.isEmpty()) {
@@ -870,6 +877,67 @@ public class CoordinatorNode extends Node {
             c.init(Cipher.DECRYPT_MODE, new SecretKeySpec(key, "AES"), new IvParameterSpec(iv));
             return c.doFinal(data);
         } catch (Exception e) { throw new RuntimeException("AES decrypt failed", e); }
+    }
+
+    // =========================================================================
+    //  Garbage collection
+    //
+    //  Old committed versions and failed uncommitted versions are cleaned up
+    //  to prevent unbounded memory growth. The coordinator deletes local
+    //  metadata immediately and sends fire-and-forget DeleteVersionData to
+    //  regions. If the delete message is lost, the region keeps orphaned data
+    //  that is unreachable (no coordinator metadata points to it).
+    // =========================================================================
+
+    /**
+     * Delete old versions of a key from coordinator metadata and send
+     * fire-and-forget delete messages to regions.
+     *
+     * @param key         the object key
+     * @param keepVersion the version to keep (latest committed); all others deleted
+     */
+    private void gcOldVersions(String key, int keepVersion) {
+        Map<Integer, VersionMetadata> versions = allVersions.get(key);
+        if (versions == null) return;
+
+        java.util.List<Integer> toDelete = new java.util.ArrayList<>();
+        for (Map.Entry<Integer, VersionMetadata> e : versions.entrySet()) {
+            if (e.getKey() != keepVersion) {
+                toDelete.add(e.getKey());
+            }
+        }
+
+        for (int oldVersion : toDelete) {
+            VersionMetadata oldMeta = versions.remove(oldVersion);
+            // Send fire-and-forget deletes to regions that had this version's data.
+            // Use the old version's k+m (may differ from current after dynamic join).
+            int oldRegionCount = Math.min(oldMeta.k + oldMeta.m, regions.size());
+            for (int i = 0; i < oldRegionCount; i++) {
+                send(new DeleteVersionData(key, oldVersion), regions.get(i));
+            }
+            log("GC: deleted version " + oldVersion + " of key=" + key
+                + " (sent deletes to " + oldRegionCount + " regions)");
+        }
+    }
+
+    /**
+     * Delete a single uncommitted version (from a failed/timed-out write).
+     */
+    private void gcUncommittedVersion(String key, int version) {
+        Map<Integer, VersionMetadata> versions = allVersions.get(key);
+        if (versions == null) return;
+
+        VersionMetadata meta = versions.remove(version);
+        if (meta == null) return;
+
+        int regionCount = Math.min(meta.k + meta.m, regions.size());
+        for (int i = 0; i < regionCount; i++) {
+            send(new DeleteVersionData(key, version), regions.get(i));
+        }
+        log("GC: deleted uncommitted v=" + version + " of key=" + key);
+
+        // Clean up the outer map if no versions remain
+        if (versions.isEmpty()) allVersions.remove(key);
     }
 
     // =========================================================================

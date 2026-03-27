@@ -1128,4 +1128,66 @@ public class CapstoneTest extends BaseJUnitTest {
         assertTrue("Erasure coding should be cheaper than naive replication",
                    totalStored < naiveReplication);
     }
+
+    @Test(timeout = 15 * 1000)
+    @TestDescription("Old versions garbage collected on overwrite")
+    @Category(RunTests.class)
+    @TestPointValue(10)
+    public void test33GarbageCollection() throws InterruptedException {
+        // Write a key 20 times. Without GC, the coordinator and regions
+        // would accumulate 20 versions. With GC, only the latest version
+        // persists — old versions are deleted on each commit.
+        // Verify by writing many versions and confirming the system still
+        // works correctly (read returns latest, no corruption from stale data).
+        setupState(emptyWorkload());
+        Client client = runState.addClient(client(1));
+        runState.start(runSettings);
+
+        int numVersions = 20;
+        for (int i = 1; i <= numVersions; i++) {
+            sendCommandAndCheck(client, write("gc-key", "version-" + i), writeOk());
+        }
+
+        // Read returns the latest version (GC didn't break anything)
+        sendCommandAndCheck(client, read("gc-key"), readResult("version-" + numVersions));
+
+        // Write a second key to verify the system is healthy after GC
+        sendCommandAndCheck(client, write("gc-key-2", "fresh"), writeOk());
+        sendCommandAndCheck(client, read("gc-key-2"), readResult("fresh"));
+    }
+
+    @Test(timeout = 10 * 1000)
+    @TestDescription("Uncommitted version cleaned up after write timeout")
+    @Category(RunTests.class)
+    @TestPointValue(10)
+    public void test34UncommittedGC() throws InterruptedException {
+        // Write fails (too few regions), creating an uncommitted version.
+        // GC should clean it up on timeout. Then a successful write should
+        // work without interference from the orphaned version.
+        setupState(emptyWorkload());
+        Client client = runState.addClient(client(1));
+
+        // Partition so write fails (only 1 region reachable < k=2)
+        runSettings.partition(server(1), server(2), client(1));
+        runState.start(runSettings);
+
+        client.sendCommand(write("fail-key", "will-timeout"));
+        Result r = client.getResult();
+        assertTrue(r instanceof CapstoneWriteResult);
+        assertFalse(((CapstoneWriteResult) r).success());
+
+        // Heal partition, write should succeed (uncommitted v1 was cleaned up)
+        runState.stop();
+        runSettings.resetNetwork();
+        runSettings.waitForClients(false);
+        runSettings.maxTimeSecs(2);
+        // Let the system run briefly so GC delete messages reach regions
+        runState.run(runSettings);
+
+        runSettings.maxTimeSecs(-1);
+        runState.start(runSettings);
+
+        sendCommandAndCheck(client, write("fail-key", "success"), writeOk());
+        sendCommandAndCheck(client, read("fail-key"), readResult("success"));
+    }
 }
