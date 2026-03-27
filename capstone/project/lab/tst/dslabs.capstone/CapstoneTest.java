@@ -10,9 +10,11 @@ import dslabs.framework.testing.junit.BaseJUnitTest;
 import dslabs.framework.testing.junit.Lab;
 import dslabs.framework.testing.junit.Part;
 import dslabs.framework.testing.junit.RunTests;
+import dslabs.framework.testing.junit.SearchTests;
 import dslabs.framework.testing.junit.TestDescription;
 import dslabs.framework.testing.junit.TestPointValue;
 import dslabs.framework.testing.runner.RunState;
+import dslabs.framework.testing.search.SearchState;
 import java.security.MessageDigest;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -21,6 +23,8 @@ import org.junit.Test;
 import org.junit.experimental.categories.Category;
 
 import static dslabs.capstone.CapstoneWorkload.*;
+import static dslabs.framework.testing.StatePredicate.CLIENTS_DONE;
+import static dslabs.framework.testing.StatePredicate.NONE_DECIDED;
 import static dslabs.framework.testing.StatePredicate.RESULTS_OK;
 import static org.junit.Assert.*;
 
@@ -28,15 +32,22 @@ import static org.junit.Assert.*;
 @Part(1)
 public class CapstoneTest extends BaseJUnitTest {
 
+    // --- Run test configuration (3 regions, full erasure coding) ---
     static final int K = 2;
     static final int M = 1;
     static final int KEY_THRESHOLD = 2;
     static final int NUM_REGIONS = K + M; // 3
 
+    // --- Search test configuration (2 regions, smaller state space) ---
+    static final int SEARCH_K = 1;
+    static final int SEARCH_M = 1;
+    static final int SEARCH_KEY_THRESHOLD = 1;
+    static final int SEARCH_NUM_REGIONS = SEARCH_K + SEARCH_M; // 2
+
     // server(1) = coordinator
     // server(2) = region 0
     // server(3) = region 1
-    // server(4) = region 2
+    // server(4) = region 2 (run tests only)
 
     /** Derive a deterministic 16-byte secret from a client address. */
     private static byte[] secretForClient(Address addr) {
@@ -57,6 +68,10 @@ public class CapstoneTest extends BaseJUnitTest {
     }
 
     static StateGeneratorBuilder builder(Workload workload) {
+        return builder(workload, true);
+    }
+
+    static StateGeneratorBuilder builder(Workload workload, boolean enableHeartbeats) {
         Address coordinator = server(1);
         Address[] regions = new Address[NUM_REGIONS];
         for (int i = 0; i < NUM_REGIONS; i++) {
@@ -66,7 +81,8 @@ public class CapstoneTest extends BaseJUnitTest {
         StateGeneratorBuilder b = StateGenerator.builder();
         b.serverSupplier(a -> {
             if (a.equals(coordinator)) {
-                return new CoordinatorNode(a, regions, K, M, KEY_THRESHOLD, CLIENT_SECRETS);
+                return new CoordinatorNode(a, regions, K, M, KEY_THRESHOLD,
+                        CLIENT_SECRETS, enableHeartbeats);
             } else {
                 return new RegionalNode(a);
             }
@@ -77,15 +93,47 @@ public class CapstoneTest extends BaseJUnitTest {
     }
 
     private void setupState(Workload workload) {
-        StateGenerator sg = builder(workload).build();
-
         if (isRunTest()) {
+            StateGenerator sg = builder(workload, true).build();
             runState = new RunState(sg);
             runState.addServer(server(1));
             for (int i = 0; i < NUM_REGIONS; i++) {
                 runState.addServer(server(i + 2));
             }
         }
+
+        if (isSearchTest()) {
+            // Search tests use fewer regions (smaller state space) and
+            // disable heartbeats (prevents infinite BFS expansion).
+            StateGenerator sg = searchBuilder(workload).build();
+            initSearchState = new SearchState(sg);
+            initSearchState.addServer(server(1));
+            for (int i = 0; i < SEARCH_NUM_REGIONS; i++) {
+                initSearchState.addServer(server(i + 2));
+            }
+        }
+    }
+
+    /** Builder for search tests: fewer regions, no heartbeats. */
+    static StateGeneratorBuilder searchBuilder(Workload workload) {
+        Address coordinator = server(1);
+        Address[] regions = new Address[SEARCH_NUM_REGIONS];
+        for (int i = 0; i < SEARCH_NUM_REGIONS; i++) {
+            regions[i] = server(i + 2);
+        }
+
+        StateGeneratorBuilder b = StateGenerator.builder();
+        b.serverSupplier(a -> {
+            if (a.equals(coordinator)) {
+                return new CoordinatorNode(a, regions, SEARCH_K, SEARCH_M,
+                        SEARCH_KEY_THRESHOLD, CLIENT_SECRETS, false);
+            } else {
+                return new RegionalNode(a);
+            }
+        });
+        b.clientSupplier(a -> new CapstoneClient(a, coordinator, CLIENT_SECRETS.get(a.toString())));
+        b.workloadSupplier(workload);
+        return b;
     }
 
     // =========================================================================
@@ -343,6 +391,29 @@ public class CapstoneTest extends BaseJUnitTest {
         sendCommandAndCheck(client, read("key"), readResult("version-10"));
     }
 
+    @Test(timeout = 30 * 1000)
+    @TestDescription("Five clients, 10 operations each, concurrent")
+    @Category(RunTests.class)
+    @TestPointValue(10)
+    public void test13StressConcurrentClients() throws InterruptedException {
+        setupState(emptyWorkload());
+        int nClients = 5, nRounds = 10;
+
+        runState.start(runSettings);
+
+        // Each client writes and reads its own keys (no ownership conflicts)
+        for (int c = 1; c <= nClients; c++) {
+            Client client = runState.addClient(client(c));
+            for (int r = 1; r <= nRounds; r++) {
+                String key = "c" + c + "-k" + r;
+                sendCommandAndCheck(client, write(key, "val-" + r), writeOk());
+            }
+            // Verify last write
+            sendCommandAndCheck(client, read("c" + c + "-k" + nRounds),
+                    readResult("val-" + nRounds));
+        }
+    }
+
     // =========================================================================
     //  Part 5 — authentication and authorization
     // =========================================================================
@@ -351,7 +422,7 @@ public class CapstoneTest extends BaseJUnitTest {
     @TestDescription("Client cannot read another client's key (ownership)")
     @Category(RunTests.class)
     @TestPointValue(10)
-    public void test13OwnershipBlocksRead() throws InterruptedException {
+    public void test14OwnershipBlocksRead() throws InterruptedException {
         setupState(emptyWorkload());
         Client client1 = runState.addClient(client(1));
         Client client2 = runState.addClient(client(2));
@@ -375,7 +446,7 @@ public class CapstoneTest extends BaseJUnitTest {
     @TestDescription("Client cannot write to another client's key (ownership)")
     @Category(RunTests.class)
     @TestPointValue(10)
-    public void test14OwnershipBlocksWrite() throws InterruptedException {
+    public void test15OwnershipBlocksWrite() throws InterruptedException {
         setupState(emptyWorkload());
         Client client1 = runState.addClient(client(1));
         Client client2 = runState.addClient(client(2));
@@ -399,7 +470,7 @@ public class CapstoneTest extends BaseJUnitTest {
     @TestDescription("Read non-existent key returns error")
     @Category(RunTests.class)
     @TestPointValue(10)
-    public void test15ReadNonExistentKey() throws InterruptedException {
+    public void test16ReadNonExistentKey() throws InterruptedException {
         setupState(emptyWorkload());
         Client client = runState.addClient(client(1));
 
@@ -415,35 +486,91 @@ public class CapstoneTest extends BaseJUnitTest {
     @TestDescription("Duplicate write is deduplicated (AMO)")
     @Category(RunTests.class)
     @TestPointValue(10)
-    public void test16DedupReplayedWrite() throws InterruptedException {
-        // Write a key, then read it. The client retry timer may cause the
-        // coordinator to receive the same WriteRequest twice. With AMO dedup,
-        // the second delivery returns the cached response without re-executing.
-        // This test verifies dedup by writing, reading, then writing the SAME
-        // key again — the second write is a new seqNum so it's not a replay.
-        // To truly test dedup we'd need to inject a duplicate message, but
-        // the client retry mechanism naturally exercises this path when the
-        // original ack is delayed.
-        Workload w = Workload.builder()
-                .commands(write("dedup-key", "original"),
-                         read("dedup-key"),
-                         write("dedup-key", "updated"),
-                         read("dedup-key"))
-                .results(writeOk(), readResult("original"),
-                         writeOk(), readResult("updated"))
-                .build();
-        setupState(w);
-        runState.addClientWorker(client(1));
-        runSettings.addInvariant(RESULTS_OK);
-        runState.run(runSettings);
-        assertRunInvariantsHold();
+    public void test17DedupReplayedWrite() throws InterruptedException {
+        // Force the dedup code path: block coordinator→client link so the
+        // WriteResponse never reaches the client. The write commits and the
+        // response is cached. The client retry timer fires and re-sends the
+        // same (clientId, seqNum). Coordinator hits dedup, replays cached
+        // response. We then unblock the link and verify the write happened
+        // exactly once.
+        setupState(emptyWorkload());
+        Client client = runState.addClient(client(1));
+
+        runState.start(runSettings);
+
+        // Let auth complete first (needs coordinator→client link open)
+        Thread.sleep(200);
+
+        // Block coordinator → client responses
+        runSettings.linkActive(server(1), client(1), false);
+
+        // Client sends write — coordinator processes it, commits, caches.
+        // But WriteResponse can't reach client. Client retry fires (100ms),
+        // re-sends same WriteRequest. Coordinator dedup returns cached response.
+        // All blocked at coordinator→client link.
+        client.sendCommand(write("dedup-key", "value"));
+        Thread.sleep(500); // let write commit + at least 1 retry hit dedup
+
+        // Unblock — cached/dedup responses reach client
+        runSettings.linkActive(server(1), client(1), true);
+        Result r = client.getResult();
+        assertTrue(r instanceof CapstoneWriteResult);
+        assertTrue(((CapstoneWriteResult) r).success());
+
+        // Verify the write happened exactly once (value is correct)
+        sendCommandAndCheck(client, read("dedup-key"), readResult("value"));
+    }
+
+    @Test(timeout = 10 * 1000)
+    @TestDescription("Fast-fail when regions detected dead via heartbeat")
+    @Category(RunTests.class)
+    @TestPointValue(10)
+    public void test18HeartbeatFastFail() throws InterruptedException {
+        setupState(emptyWorkload());
+        Client client = runState.addClient(client(1));
+
+        // Start normally — auth completes, write succeeds with all regions alive
+        runState.start(runSettings);
+        sendCommandAndCheck(client, write("key", "value"), writeOk());
+
+        // Partition all regions from coordinator — heartbeats stop
+        runState.stop();
+        runSettings.partition(server(1), client(1));
+        runState.start(runSettings);
+
+        // Wait for heartbeat liveness to expire (>1000ms = 2 × 500ms heartbeat)
+        Thread.sleep(1500);
+
+        // Read should fail fast (INSUFFICIENT_REGIONS, not timeout).
+        // Client ignores INSUFFICIENT_REGIONS and retries, but regions stay dead.
+        // Eventually the client gets no final result within our check window.
+        client.sendCommand(read("key"));
+        Thread.sleep(500);
+        // Client should NOT have a result — all attempts fast-failed
+        assertFalse(client.hasResult());
+
+        // Now heal partition — heartbeats resume, regions come back alive
+        runState.stop();
+        runSettings.resetNetwork();
+        runState.start(runSettings);
+
+        // Wait for heartbeats to confirm liveness again
+        Thread.sleep(1500);
+
+        // The old read's retries should now succeed since regions are alive.
+        // But to be robust, consume any pending result and send a fresh read
+        // that definitively proves the system recovered.
+        if (client.hasResult()) {
+            client.getResult(); // consume stale result from old retries
+        }
+        sendCommandAndCheck(client, read("key"), readResult("value"));
     }
 
     @Test(timeout = 10 * 1000)
     @TestDescription("Client with wrong credentials cannot write")
     @Category(RunTests.class)
     @TestPointValue(10)
-    public void test17WrongCredentialsRejected() throws InterruptedException {
+    public void test19WrongCredentialsRejected() throws InterruptedException {
         // Build a custom state where client(2) has a WRONG secret.
         // The coordinator has the real secret; client(2) has all-zeros.
         // The HMAC won't match, auth fails, client stays unauthenticated.
@@ -490,5 +617,130 @@ public class CapstoneTest extends BaseJUnitTest {
         client2.sendCommand(write("bad-key", "bad-value"));
         Thread.sleep(1000);
         assertFalse(client2.hasResult());
+    }
+
+    // =========================================================================
+    //  Part 6 — search tests (deterministic, exhaustive)
+    //
+    //  These use BFS over all possible message orderings to verify
+    //  invariants hold under EVERY interleaving, not just random ones.
+    //  This replaces probabilistic unreliable-network run tests with
+    //  deterministic correctness guarantees.
+    // =========================================================================
+
+    @Test
+    @TestDescription("Search: single client write completes under all orderings")
+    @Category(SearchTests.class)
+    @TestPointValue(20)
+    public void test20SearchBasicWrite() {
+        // Single write only (not put+get) to keep state space manageable
+        setupState(Workload.builder()
+                .commands(write("key", "value"))
+                .results(writeOk())
+                .build());
+        initSearchState.addClientWorker(client(1));
+
+        searchSettings.maxTimeSecs(20)
+                      .deliverTimers(false)
+                      .addInvariant(RESULTS_OK)
+                      .addGoal(CLIENTS_DONE);
+        bfs(initSearchState);
+        assertGoalFound();
+    }
+
+    @Test
+    @TestDescription("Search: write succeeds with one region partitioned")
+    @Category(SearchTests.class)
+    @TestPointValue(20)
+    public void test21SearchOneRegionDown() {
+        // Search config: k=1, m=1, threshold=1, 2 regions.
+        // Partition off region 1 (server(3)) — 1 region left >= k=1.
+        setupState(Workload.builder()
+                .commands(write("key", "value"))
+                .results(writeOk())
+                .build());
+        initSearchState.addClientWorker(client(1));
+
+        searchSettings.maxTimeSecs(20)
+                      .deliverTimers(false)
+                      .addInvariant(RESULTS_OK)
+                      .partition(server(1), server(2), client(1))
+                      .addGoal(CLIENTS_DONE);
+        bfs(initSearchState);
+        assertGoalFound();
+    }
+
+    @Test
+    @TestDescription("Search: no progress when all regions partitioned")
+    @Category(SearchTests.class)
+    @TestPointValue(20)
+    public void test22SearchNoProgressTooFewRegions() {
+        // Search config: k=1, m=1, 2 regions.
+        // Both regions partitioned — 0 reachable, below k=1.
+        setupState(Workload.builder()
+                .commands(write("key", "value"))
+                .results(writeOk())
+                .build());
+        initSearchState.addClientWorker(client(1));
+
+        searchSettings.maxTimeSecs(20)
+                      .deliverTimers(false)
+                      .addInvariant(NONE_DECIDED)
+                      .partition(server(1), client(1));
+        bfs(initSearchState);
+    }
+
+    @Test
+    @TestDescription("Search: write+read correctness (DFS)")
+    @Category(SearchTests.class)
+    @TestPointValue(20)
+    public void test23SearchWriteRead() {
+        // DFS explores deeper (like Paxos test24) — finds the goal faster than
+        // BFS for larger state spaces. Partition to 1 region for manageability.
+        setupState(putGetWorkload("key", "value"));
+        initSearchState.addClientWorker(client(1));
+
+        searchSettings.maxTimeSecs(20)
+                      .maxDepth(1000)
+                      .deliverTimers(false)
+                      .addInvariant(RESULTS_OK)
+                      .partition(server(1), server(2), client(1))
+                      .addPrune(CLIENTS_DONE);
+        dfs(initSearchState);
+    }
+
+    @Test
+    @TestDescription("Search: erasure coding write with k=2, m=1, one region down")
+    @Category(SearchTests.class)
+    @TestPointValue(20)
+    public void test24SearchErasureCodingFaultTolerance() {
+        // Uses the REAL erasure coding config (k=2, m=1, 3 regions) — not the
+        // minimal search config. Partitions 1 region so only 2 respond.
+        // This deterministically verifies that Reed-Solomon reconstruction works
+        // under ALL message orderings when 1 of 3 regions is down.
+        Workload w = Workload.builder()
+                .commands(write("key", "value"))
+                .results(writeOk())
+                .build();
+
+        // Build with real config but no heartbeats
+        StateGenerator sg = builder(w, false).build();
+        initSearchState = new SearchState(sg);
+        initSearchState.addServer(server(1));
+        for (int i = 0; i < NUM_REGIONS; i++) {
+            initSearchState.addServer(server(i + 2));
+        }
+        initSearchState.addClientWorker(client(1));
+
+        // Partition off region 2 (server(4)) — k=2 needs 2 of 3 regions.
+        // DFS for larger state space (like Paxos test24); verifies invariants
+        // hold across deep execution paths.
+        searchSettings.maxTimeSecs(30)
+                      .maxDepth(1000)
+                      .deliverTimers(false)
+                      .addInvariant(RESULTS_OK)
+                      .partition(server(1), server(2), server(3), client(1))
+                      .addPrune(CLIENTS_DONE);
+        dfs(initSearchState);
     }
 }

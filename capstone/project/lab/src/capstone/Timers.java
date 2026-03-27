@@ -43,7 +43,7 @@ final class ClientRetryTimer implements Timer {
  */
 @Data
 final class HeartbeatTimer implements Timer {
-    static final int HEARTBEAT_MILLIS = 50;
+    static final int HEARTBEAT_MILLIS = 500;
 }
 
 /**

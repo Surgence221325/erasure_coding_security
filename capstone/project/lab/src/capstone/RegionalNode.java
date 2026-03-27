@@ -65,8 +65,10 @@ public class RegionalNode extends Node {
             fragments.computeIfAbsent(m.key(), k -> new HashMap<>());
 
         if (byVersion.containsKey(m.version())) {
-            log("Rejecting duplicate FragmentWrite for key=" + m.key() + " v=" + m.version());
-            send(new FragmentAck(m.key(), m.version(), m.regionIndex(), false), sender);
+            // Already stored — idempotent ack. This handles retransmissions
+            // where the original ack was lost in an unreliable network.
+            log("Duplicate FragmentWrite for key=" + m.key() + " v=" + m.version() + " — acking success");
+            send(new FragmentAck(m.key(), m.version(), m.regionIndex(), true), sender);
             return;
         }
 
@@ -88,8 +90,8 @@ public class RegionalNode extends Node {
             keyShares.computeIfAbsent(m.key(), k -> new HashMap<>());
 
         if (byVersion.containsKey(m.version())) {
-            log("Rejecting duplicate KeyShareWrite for key=" + m.key() + " v=" + m.version());
-            send(new KeyShareAck(m.key(), m.version(), m.regionIndex(), false), sender);
+            log("Duplicate KeyShareWrite for key=" + m.key() + " v=" + m.version() + " — acking success");
+            send(new KeyShareAck(m.key(), m.version(), m.regionIndex(), true), sender);
             return;
         }
 

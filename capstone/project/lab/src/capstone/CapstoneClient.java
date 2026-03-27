@@ -126,7 +126,12 @@ public final class CapstoneClient extends Node implements Client {
             sessionToken  = result.sessionToken();
             authenticated = true;
             log("Authenticated, token=" + sessionToken);
-            notifyAll();  // wake up any blocked sendCommand
+            // Immediately re-send pending command with valid token (if any).
+            // This ensures progress even without retry timers (e.g., in search tests).
+            if (pendingCommand != null) {
+                sendPending();
+            }
+            notifyAll();
         } else {
             log("Auth failed: " + result.error());
         }
@@ -146,8 +151,9 @@ public final class CapstoneClient extends Node implements Client {
     private synchronized void handleWriteResponse(WriteResponse resp, Address sender) {
         if (pendingCommand == null || pendingSeq != resp.sequenceNum()) return;
 
-        // Ignore AUTH_REQUIRED — retry timer will re-send after auth completes
+        // Ignore transient errors — retry timer will re-send
         if ("AUTH_REQUIRED".equals(resp.error())) return;
+        if ("INSUFFICIENT_REGIONS".equals(resp.error())) return;
 
         pendingResult  = new CapstoneWriteResult(resp.success(), resp.error());
         pendingCommand = null;
@@ -157,8 +163,9 @@ public final class CapstoneClient extends Node implements Client {
     private synchronized void handleReadResponse(ReadResponse resp, Address sender) {
         if (pendingCommand == null || pendingSeq != resp.sequenceNum()) return;
 
-        // Ignore AUTH_REQUIRED — retry timer will re-send after auth completes
+        // Ignore transient errors — retry timer will re-send
         if ("AUTH_REQUIRED".equals(resp.error())) return;
+        if ("INSUFFICIENT_REGIONS".equals(resp.error())) return;
 
         pendingResult  = new CapstoneReadResult(resp.value(), resp.error());
         pendingCommand = null;

@@ -85,6 +85,10 @@ public class CoordinatorNode extends Node {
     // Precomputed erasure coder (stateless, safe to share)
     private final ErasureCoder erasureCoder;
 
+    // Whether to send periodic heartbeats (disabled during search tests
+    // to prevent infinite state space expansion)
+    private final boolean enableHeartbeats;
+
     // --- Authentication secrets (clientId -> pre-shared secret, immutable) ---
     private final Map<String, byte[]> clientSecrets;
 
@@ -103,10 +107,16 @@ public class CoordinatorNode extends Node {
     private Map<String, PendingRead> pendingReads;
 
     // --- AMO deduplication for writes ---
-    // clientId -> (seqNum -> cached WriteResponse)
-    private Map<String, Map<Integer, WriteResponse>> writeDedup;
+    // Since each client processes commands sequentially with monotonically
+    // increasing seqNums, we only need to store the LATEST (seqNum, response)
+    // per client.  Any replay with seqNum <= lastProcessed is stale.
+    // clientId -> (latestSeqNum, cachedResponse)
+    private Map<String, DedupEntry> writeDedup;
 
     // --- Region liveness (region address -> last heartbeat reply time ms) ---
+    // A region is considered dead if no heartbeat reply in REGION_DEAD_MILLIS.
+    // Dead regions are skipped in fan-out to save network traffic.
+    private static final long REGION_DEAD_MILLIS = 2 * HeartbeatTimer.HEARTBEAT_MILLIS; // 1000ms
     private Map<Address, Long> lastHeartbeat;
 
     // --- Authentication state ---
@@ -120,13 +130,20 @@ public class CoordinatorNode extends Node {
 
     public CoordinatorNode(Address address, Address[] regions, int k, int m,
                            int keyThreshold, Map<String, byte[]> clientSecrets) {
+        this(address, regions, k, m, keyThreshold, clientSecrets, true);
+    }
+
+    public CoordinatorNode(Address address, Address[] regions, int k, int m,
+                           int keyThreshold, Map<String, byte[]> clientSecrets,
+                           boolean enableHeartbeats) {
         super(address);
-        this.regions       = regions;
-        this.k             = k;
-        this.m             = m;
-        this.keyThreshold  = keyThreshold;
-        this.erasureCoder  = new ErasureCoder(k, m);
-        this.clientSecrets = clientSecrets;
+        this.regions          = regions;
+        this.k                = k;
+        this.m                = m;
+        this.keyThreshold     = keyThreshold;
+        this.erasureCoder     = new ErasureCoder(k, m);
+        this.clientSecrets    = clientSecrets;
+        this.enableHeartbeats = enableHeartbeats;
     }
 
     @Override
@@ -146,8 +163,11 @@ public class CoordinatorNode extends Node {
         long now = System.currentTimeMillis();
         for (Address r : regions) lastHeartbeat.put(r, now);
 
-        // Start the recurring heartbeat timer.
-        set(new HeartbeatTimer(), HeartbeatTimer.HEARTBEAT_MILLIS);
+        // Start the recurring heartbeat timer (disabled during search tests
+        // to prevent infinite BFS state expansion).
+        if (enableHeartbeats) {
+            set(new HeartbeatTimer(), HeartbeatTimer.HEARTBEAT_MILLIS);
+        }
     }
 
     // =========================================================================
@@ -163,10 +183,23 @@ public class CoordinatorNode extends Node {
             return;
         }
 
-        // Generate nonce and send challenge
-        byte[] nonce = new byte[16];
-        RNG.nextBytes(nonce);
-        pendingAuths.put(req.clientId(), nonce);
+        // If already authenticated, re-send the token (handles lost AuthResultMsg)
+        String existingToken = getSessionForClient(req.clientId());
+        if (existingToken != null) {
+            log("Already authenticated: " + req.clientId() + " — re-sending token");
+            send(new AuthResultMsg(req.clientId(), existingToken, true, null), sender);
+            return;
+        }
+
+        // If there's already a pending challenge, re-send the SAME nonce.
+        // This prevents a race where a retried AuthRequest overwrites the nonce
+        // that an in-flight AuthResponse is using.
+        byte[] nonce = pendingAuths.get(req.clientId());
+        if (nonce == null) {
+            nonce = new byte[16];
+            RNG.nextBytes(nonce);
+            pendingAuths.put(req.clientId(), nonce);
+        }
         send(new AuthChallenge(req.clientId(), nonce), sender);
         log("Sent auth challenge to " + req.clientId());
     }
@@ -188,7 +221,14 @@ public class CoordinatorNode extends Node {
             return;
         }
 
-        // Issue session token
+        // Revoke any previous session token for this client (prevents accumulation)
+        String oldToken = getSessionForClient(resp.clientId());
+        if (oldToken != null) {
+            validSessions.remove(oldToken);
+            log("Revoked old token for " + resp.clientId());
+        }
+
+        // Issue new session token
         byte[] tokenBytes = new byte[16];
         RNG.nextBytes(tokenBytes);
         StringBuilder sb = new StringBuilder();
@@ -208,6 +248,37 @@ public class CoordinatorNode extends Node {
     private String validateSession(String sessionToken) {
         if (sessionToken == null) return null;
         return validSessions.get(sessionToken);
+    }
+
+    /** Reverse lookup: find the session token for a given clientId, or null. */
+    private String getSessionForClient(String clientId) {
+        for (Map.Entry<String, String> e : validSessions.entrySet()) {
+            if (e.getValue().equals(clientId)) return e.getKey();
+        }
+        return null;
+    }
+
+    // =========================================================================
+    //  Region liveness
+    // =========================================================================
+
+    private boolean isRegionAlive(Address region) {
+        Long last = lastHeartbeat.get(region);
+        if (last == null) return false;
+        return (System.currentTimeMillis() - last) < REGION_DEAD_MILLIS;
+    }
+
+    private int countAliveRegions() {
+        int count = 0;
+        for (Address r : regions) {
+            if (isRegionAlive(r)) count++;
+        }
+        return count;
+    }
+
+    /** Minimum alive regions needed: must have enough for both fragments and key shares. */
+    private int minRegionsRequired() {
+        return Math.max(k, keyThreshold);
     }
 
     // =========================================================================
@@ -249,8 +320,38 @@ public class CoordinatorNode extends Node {
 
         // --- One pending write per key at a time ---
         if (pendingWrites.containsKey(req.key())) {
+            PendingWrite pw = pendingWrites.get(req.key());
+            if (pw.clientId.equals(req.clientId()) && pw.seqNum == req.sequenceNum()) {
+                // Same client retrying its own in-progress write.
+                // Re-send to regions that haven't acked yet to recover from
+                // dropped messages in an unreliable network.
+                log("Retry of in-progress write for key=" + req.key()
+                    + " — re-sending to unacked regions"
+                    + " (frags=" + pw.fragmentAcks.size() + "/" + k
+                    + ", shares=" + pw.keyShareAcks.size() + "/" + keyThreshold + ")");
+                for (int i = 0; i < k + m; i++) {
+                    if (!isRegionAlive(regions[i])) continue;
+                    if (!pw.fragmentAcks.contains(i)) {
+                        send(new FragmentWrite(req.key(), pw.version, i,
+                            pw.fragments[i], pw.checksums.get(i)), regions[i]);
+                    }
+                    if (!pw.keyShareAcks.contains(i)) {
+                        send(new KeyShareWrite(req.key(), pw.version, i,
+                            pw.keyShares[i]), regions[i]);
+                    }
+                }
+                return;
+            }
             log("Busy: write already in progress for key=" + req.key());
             send(new WriteResponse(req.clientId(), req.sequenceNum(), false, "BUSY"), sender);
+            return;
+        }
+
+        // --- Fast-fail if insufficient alive regions ---
+        int alive = countAliveRegions();
+        if (alive < minRegionsRequired()) {
+            log("Rejected: only " + alive + " regions alive, need " + minRegionsRequired());
+            send(new WriteResponse(req.clientId(), req.sequenceNum(), false, "INSUFFICIENT_REGIONS"), sender);
             return;
         }
 
@@ -280,16 +381,23 @@ public class CoordinatorNode extends Node {
             req.key(), version, k, m, keyThreshold, iv, ciphertext.length, checksums);
         allVersions.computeIfAbsent(req.key(), x -> new HashMap<>()).put(version, meta);
 
-        // --- Track the pending write ---
-        PendingWrite pending = new PendingWrite(req.clientId(), req.sequenceNum(), req.key(), version, sender);
+        // --- Track the pending write (store fragments/shares for retransmission) ---
+        PendingWrite pending = new PendingWrite(req.clientId(), req.sequenceNum(),
+            req.key(), version, sender, frags, shares, checksums);
         pendingWrites.put(req.key(), pending);
 
-        // --- Fan out: send fragment + key share to every region ---
+        // --- Fan out: send fragment + key share to alive regions only ---
+        int sent = 0;
         for (int i = 0; i < k + m; i++) {
-            send(new FragmentWrite(req.key(), version, i, frags[i], checksums.get(i)), regions[i]);
-            send(new KeyShareWrite(req.key(), version, i, shares[i]), regions[i]);
+            if (isRegionAlive(regions[i])) {
+                send(new FragmentWrite(req.key(), version, i, frags[i], checksums.get(i)), regions[i]);
+                send(new KeyShareWrite(req.key(), version, i, shares[i]), regions[i]);
+                sent++;
+            } else {
+                log("Skipping dead region-" + i + " (" + regions[i] + ")");
+            }
         }
-        log("Sent to " + (k + m) + " regions; waiting for acks");
+        log("Sent to " + sent + "/" + (k + m) + " alive regions; waiting for acks");
 
         // --- Arm a timeout so the system doesn't block on a slow/down region ---
         set(new WriteTimeoutTimer(req.key(), version), WriteTimeoutTimer.WRITE_TIMEOUT_MILLIS);
@@ -346,6 +454,11 @@ public class CoordinatorNode extends Node {
             + ", shares=" + pending.keyShareAcks.size() + "/" + keyThreshold + ")"
             + (newOwner ? " owner=" + pending.clientId : "") + " ***");
 
+        // Clear stored crypto material — no longer needed after commit
+        pending.fragments = null;
+        pending.keyShares = null;
+        pending.checksums = null;
+
         WriteResponse resp = new WriteResponse(pending.clientId, pending.seqNum, true, null);
         cacheWriteResponse(pending.clientId, pending.seqNum, resp);
         send(resp, pending.clientSender);
@@ -383,7 +496,34 @@ public class CoordinatorNode extends Node {
         }
 
         if (pendingReads.containsKey(req.key())) {
+            PendingRead pr = pendingReads.get(req.key());
+            if (pr.clientId.equals(req.clientId()) && pr.seqNum == req.sequenceNum()) {
+                // Same client retrying its own in-progress read.
+                // Re-request from regions that haven't replied yet.
+                log("Retry of in-progress read for key=" + req.key()
+                    + " — re-requesting from unresponsive regions"
+                    + " (frags=" + pr.fragments.size() + "/" + k
+                    + ", shares=" + pr.keyShares.size() + "/" + keyThreshold + ")");
+                for (int i = 0; i < k + m; i++) {
+                    if (!isRegionAlive(regions[i])) continue;
+                    if (!pr.fragments.containsKey(i)) {
+                        send(new FragmentReadRequest(req.key(), pr.version, i), regions[i]);
+                    }
+                    if (!pr.keyShares.containsKey(i)) {
+                        send(new KeyShareReadRequest(req.key(), pr.version, i), regions[i]);
+                    }
+                }
+                return;
+            }
             send(new ReadResponse(req.clientId(), req.sequenceNum(), null, "READ_IN_PROGRESS"), sender);
+            return;
+        }
+
+        // --- Fast-fail if insufficient alive regions ---
+        int alive = countAliveRegions();
+        if (alive < minRegionsRequired()) {
+            log("Rejected: only " + alive + " regions alive, need " + minRegionsRequired());
+            send(new ReadResponse(req.clientId(), req.sequenceNum(), null, "INSUFFICIENT_REGIONS"), sender);
             return;
         }
 
@@ -399,13 +539,18 @@ public class CoordinatorNode extends Node {
         PendingRead pending = new PendingRead(req.clientId(), req.sequenceNum(), req.key(), version, sender);
         pendingReads.put(req.key(), pending);
 
-        // Fan out to all regions simultaneously — use whichever k fragments +
-        // keyThreshold shares respond first.
+        // Fan out to alive regions only — skip dead ones to save traffic
+        int sent = 0;
         for (int i = 0; i < k + m; i++) {
-            send(new FragmentReadRequest(req.key(), version, i), regions[i]);
-            send(new KeyShareReadRequest(req.key(), version, i), regions[i]);
+            if (isRegionAlive(regions[i])) {
+                send(new FragmentReadRequest(req.key(), version, i), regions[i]);
+                send(new KeyShareReadRequest(req.key(), version, i), regions[i]);
+                sent++;
+            } else {
+                log("Skipping dead region-" + i + " (" + regions[i] + ")");
+            }
         }
-        log("Sent fragment + key-share requests to " + (k + m) + " regions");
+        log("Sent fragment + key-share requests to " + sent + "/" + (k + m) + " alive regions");
 
         // Arm timeout so we fail gracefully if not enough regions reply
         set(new ReadTimeoutTimer(req.key(), version), ReadTimeoutTimer.READ_TIMEOUT_MILLIS);
@@ -587,15 +732,37 @@ public class CoordinatorNode extends Node {
 
     // =========================================================================
     //  AMO dedup helpers
+    //
+    //  Sliding window: only the latest (seqNum, response) per client is kept.
+    //  Since clients send commands sequentially with monotonically increasing
+    //  seqNums, a replay of seqNum <= lastProcessed is always stale.
     // =========================================================================
 
     private WriteResponse getCachedWriteResponse(String clientId, int seqNum) {
-        Map<Integer, WriteResponse> m = writeDedup.get(clientId);
-        return (m != null) ? m.get(seqNum) : null;
+        DedupEntry entry = writeDedup.get(clientId);
+        if (entry == null) return null;
+        if (seqNum == entry.seqNum) return entry.response;
+        if (seqNum < entry.seqNum) {
+            // Stale replay — the client has moved on. Return a generic success
+            // to prevent infinite retries of an already-superseded command.
+            log("Dedup: stale replay from " + clientId + " seq=" + seqNum
+                + " (latest=" + entry.seqNum + ")");
+            return new WriteResponse(clientId, seqNum, true, null);
+        }
+        return null; // seqNum > lastProcessed → new command, not a replay
     }
 
     private void cacheWriteResponse(String clientId, int seqNum, WriteResponse resp) {
-        writeDedup.computeIfAbsent(clientId, x -> new HashMap<>()).put(seqNum, resp);
+        writeDedup.put(clientId, new DedupEntry(seqNum, resp));
+    }
+
+    private static final class DedupEntry {
+        final int           seqNum;
+        final WriteResponse response;
+        DedupEntry(int seqNum, WriteResponse response) {
+            this.seqNum   = seqNum;
+            this.response = response;
+        }
     }
 
     // =========================================================================
@@ -612,12 +779,23 @@ public class CoordinatorNode extends Node {
         final Set<Integer> keyShareAcks  = new HashSet<>();
         boolean committed = false;
 
-        PendingWrite(String clientId, int seqNum, String key, int version, Address clientSender) {
+        // Stored for retransmission to unacked regions on client retry.
+        // Cleared on commit to avoid holding crypto material longer than needed.
+        byte[][]           fragments;
+        byte[][]           keyShares;
+        Map<Integer, byte[]> checksums;
+
+        PendingWrite(String clientId, int seqNum, String key, int version,
+                     Address clientSender, byte[][] fragments, byte[][] keyShares,
+                     Map<Integer, byte[]> checksums) {
             this.clientId     = clientId;
             this.seqNum       = seqNum;
             this.key          = key;
             this.version      = version;
             this.clientSender = clientSender;
+            this.fragments    = fragments;
+            this.keyShares    = keyShares;
+            this.checksums    = checksums;
         }
     }
 
