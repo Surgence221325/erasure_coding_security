@@ -116,3 +116,44 @@ final class ReadTimeoutTimer implements Timer {
     private final String key;
     private final int    version;
 }
+
+/**
+ * Raft election timeout timer.
+ * If a follower doesn't receive a heartbeat from the leader within this window,
+ * it becomes a candidate and starts an election. Randomized to prevent split votes.
+ */
+/**
+ * Timeout for Raft log entry commit.
+ * If a log entry isn't committed by majority within this window,
+ * the pending client response is failed.
+ */
+@Data
+final class RaftCommitTimeoutTimer implements Timer {
+    static final int RAFT_COMMIT_TIMEOUT_MILLIS = 500;
+    private final int logIndex;
+}
+
+@Data
+final class RaftElectionTimer implements Timer {
+    static final int BASE_ELECTION_MILLIS = 1000;
+    static final int STAGGER_MILLIS       = 100;
+
+    /**
+     * Deterministic election timeout based on peer index.
+     * Each coordinator gets a different timeout to prevent split votes
+     * without relying on Math.random() (which breaks deterministic model checking).
+     */
+    static int timeoutForIndex(int peerIndex) {
+        return BASE_ELECTION_MILLIS + (peerIndex * STAGGER_MILLIS);
+    }
+}
+
+/**
+ * Raft leader heartbeat timer.
+ * Leader sends empty AppendEntries to all followers to suppress elections.
+ * Must be significantly shorter than the election timeout.
+ */
+@Data
+final class RaftHeartbeatTimer implements Timer {
+    static final int RAFT_HEARTBEAT_MILLIS = 150;
+}

@@ -323,3 +323,60 @@
   - AUTH_REQUIRED responses in early message logs (before auth completes)
   - proactive re-send visible in logs after "Authenticated, token=..."
   - no blocking in sendCommand()
+
+### Hook A9: Coordinator set is fixed at startup (Raft)
+- Assumption: The set of Raft coordinator replicas is known at initialization and cannot change at runtime.
+- Why we need it: Adding or removing coordinators requires Raft's joint consensus protocol — too complex. We fix the set (3 or 5 coordinators) at startup.
+- Failure-first trace if false:
+  1) Coordinator D wants to join the Raft cluster
+  2) Existing coordinators disagree on whether D is a member
+  3) Two different majorities could form (old config and new config)
+  4) Split-brain: two leaders commit conflicting entries
+- What to observe:
+  - coordinator count fixed in constructor (raftPeers array)
+  - no AddCoordinator message type
+  - dynamic REGION membership is separate and supported
+
+### Hook A10: Only the leader handles client operations (Raft)
+- Assumption: All client operations (auth, writes, reads) are processed exclusively by the Raft leader.
+- Discovery: **Reactive** (Bug 11). Initially followers handled auth directly, creating unreplicated sessions. Client's token was unknown to the leader.
+- Failure-first trace if false:
+  1) Client authenticates with follower F (session not Raft-replicated)
+  2) Client sends WriteRequest to leader L with F's token
+  3) L doesn't recognize the token → AUTH_REQUIRED
+  4) Client stuck in auth loop
+- What to observe:
+  - isLeader() check at top of handleAuthRequest, handleWriteRequest, handleReadRequest
+  - followers send NotLeaderResponse with leader address
+
+### Hook T16: Single-coordinator commitment reversed for Raft
+- Tradeoff: Design doc said "coordinator replication is out of scope." We reversed this after TA feedback.
+- Cost of implementing Raft:
+  - Every write requires Raft majority (added latency: up to 500ms on top of 300ms region timeout)
+  - 4 new bugs discovered (election instability, timeout interaction, auth-on-follower, client stuck)
+  - Write pipeline needed two-phase timeout (Bug 10, found by DFS model checking)
+  - Auth assumptions violated (Bug 11)
+  - Client needed multi-coordinator discovery (Bug 12)
+- What to observe:
+  - Raft tests (test37-44): failover, redirect, split brain, consistency, dedup
+  - DFS search test (test45): found Bug 10
+
+### Hook T17: Deterministic election timer sacrificed randomization
+- Tradeoff: Standard Raft uses random timeouts. We use deterministic stagger (1000ms + 100ms × index).
+- Why: Math.random() breaks dslabs deterministic model checking (same issue as System.currentTimeMillis()).
+- Cost: Less robust under adversarial scheduling. Deterministic stagger is predictable.
+- What to observe:
+  - RaftElectionTimer.timeoutForIndex(peerIndex)
+  - 6.7× margin (150ms heartbeat vs 1000ms+ election)
+
+### Hook T18: Two-phase write timeout (region + Raft)
+- Tradeoff: Writes have two sequential timeouts, worst-case 800ms (was 300ms single-coordinator).
+- Discovery: Bug 10 (DFS model checking) showed single timeout couldn't cover both phases.
+- Failure-first trace:
+  1) Leader fans out to regions, arms WriteTimeoutTimer (300ms)
+  2) Regions ack at 200ms → tryCommitWrite, arms RaftCommitTimeoutTimer (500ms)
+  3) If Raft majority doesn't ack in 500ms → RAFT_COMMIT_TIMEOUT (transient, client retries)
+- What to observe:
+  - WriteTimeoutTimer (300ms) for region phase
+  - RaftCommitTimeoutTimer (500ms) for Raft phase (multi-node only)
+  - client ignores RAFT_COMMIT_TIMEOUT

@@ -32,7 +32,9 @@ import lombok.ToString;
 @EqualsAndHashCode(callSuper = true)
 public final class CapstoneClient extends Node implements Client {
 
-    private final Address coordinator;
+    private final Address[] allCoordinators;  // all known coordinator addresses
+    private Address coordinator;               // current coordinator (may change on redirect)
+    private int     coordinatorIndex;          // index into allCoordinators for round-robin
     private final byte[]  sharedSecret;
 
     // Sequence number for the next request
@@ -49,10 +51,22 @@ public final class CapstoneClient extends Node implements Client {
     private boolean authenticated;
     private String  sessionToken;
 
+    // Track consecutive auth failures to trigger coordinator rotation
+    private int authFailureCount;
+    private static final int AUTH_FAILURES_BEFORE_ROTATE = 3;
+
+    /** Single-coordinator constructor (backward compatible). */
     public CapstoneClient(Address address, Address coordinator, byte[] sharedSecret) {
+        this(address, new Address[]{coordinator}, sharedSecret);
+    }
+
+    /** Multi-coordinator constructor (for Raft). */
+    public CapstoneClient(Address address, Address[] coordinators, byte[] sharedSecret) {
         super(address);
-        this.coordinator  = coordinator;
-        this.sharedSecret = sharedSecret;
+        this.allCoordinators = coordinators;
+        this.coordinator     = coordinators[0];
+        this.coordinatorIndex = 0;
+        this.sharedSecret    = sharedSecret;
     }
 
     @Override
@@ -61,13 +75,23 @@ public final class CapstoneClient extends Node implements Client {
         pendingSeq     = -1;
         pendingCommand = null;
         pendingResult  = null;
-        authenticated  = false;
-        sessionToken   = null;
+        authenticated    = false;
+        sessionToken     = null;
+        authFailureCount = 0;
 
         // Initiate authentication handshake
         AuthRetryTimer authTimer = new AuthRetryTimer();
         send(new AuthRequest(address().toString()), coordinator);
         set(authTimer, authTimer.backoffMillis());
+    }
+
+    /** Try the next coordinator in the list (round-robin). */
+    private void rotateCoordinator() {
+        coordinatorIndex = (coordinatorIndex + 1) % allCoordinators.length;
+        coordinator = allCoordinators[coordinatorIndex];
+        authenticated = false;
+        sessionToken  = null;
+        log("Rotating to coordinator " + coordinator);
     }
 
     // =========================================================================
@@ -139,10 +163,39 @@ public final class CapstoneClient extends Node implements Client {
 
     private synchronized void onAuthRetryTimer(AuthRetryTimer t) {
         if (authenticated) return;
-        log("Retrying auth (backoff=" + t.backoffMillis() + "ms)");
+
+        // If auth keeps failing with current coordinator, try the next one
+        authFailureCount++;
+        if (authFailureCount >= AUTH_FAILURES_BEFORE_ROTATE && allCoordinators.length > 1) {
+            rotateCoordinator();
+            authFailureCount = 0;
+        }
+
+        log("Retrying auth (backoff=" + t.backoffMillis() + "ms) with " + coordinator);
         send(new AuthRequest(address().toString()), coordinator);
         AuthRetryTimer next = t.nextBackoff();
         set(next, next.backoffMillis());
+    }
+
+    // =========================================================================
+    //  Raft redirect handler
+    // =========================================================================
+
+    private synchronized void handleNotLeaderResponse(NotLeaderResponse resp, Address sender) {
+        if (resp.leaderAddress() != null && !resp.leaderAddress().equals(coordinator)) {
+            log("Redirected to leader " + resp.leaderAddress());
+            coordinator = resp.leaderAddress();
+            // Need to re-authenticate with the new leader
+            authenticated = false;
+            sessionToken  = null;
+            send(new AuthRequest(address().toString()), coordinator);
+            AuthRetryTimer authTimer = new AuthRetryTimer();
+            set(authTimer, authTimer.backoffMillis());
+        }
+        // Re-send pending command will happen via retry timer or auth completion
+        if (pendingCommand != null && authenticated) {
+            sendPending();
+        }
     }
 
     // =========================================================================
@@ -156,6 +209,7 @@ public final class CapstoneClient extends Node implements Client {
         if ("AUTH_REQUIRED".equals(resp.error())) return;
         if ("INSUFFICIENT_REGIONS".equals(resp.error())) return;
         if ("RECONFIGURING".equals(resp.error())) return;
+        if ("RAFT_COMMIT_TIMEOUT".equals(resp.error())) return;
 
         pendingResult  = new CapstoneWriteResult(resp.success(), resp.error());
         pendingCommand = null;

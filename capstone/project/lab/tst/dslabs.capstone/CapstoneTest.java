@@ -1291,4 +1291,419 @@ public class CapstoneTest extends BaseJUnitTest {
         // Read returns the new version
         sendCommandAndCheck(client, read("mixed-key"), readResult("new-config"));
     }
+
+    // =========================================================================
+    //  Part 10 — Raft consensus tests
+    //
+    //  These use 3 coordinator replicas + 3 regions.
+    //  server(1-3) = coordinators, server(4-6) = regions
+    //  Clients initially connect to server(1); redirected to leader if needed.
+    // =========================================================================
+
+    static final int RAFT_NUM_COORDINATORS = 3;
+
+    /** Set up a Raft-replicated system: 3 coordinators + 3 regions. */
+    private void setupRaftState(Workload workload) {
+        // Coordinator addresses
+        Address[] coordinators = new Address[RAFT_NUM_COORDINATORS];
+        for (int i = 0; i < RAFT_NUM_COORDINATORS; i++) {
+            coordinators[i] = server(i + 1);
+        }
+
+        // Region addresses (after coordinators)
+        Address[] regions = new Address[NUM_REGIONS];
+        for (int i = 0; i < NUM_REGIONS; i++) {
+            regions[i] = server(RAFT_NUM_COORDINATORS + i + 1);  // server(4,5,6)
+        }
+
+        StateGeneratorBuilder b = StateGenerator.builder();
+        b.serverSupplier(a -> {
+            // Check if this address is a coordinator
+            for (int i = 0; i < RAFT_NUM_COORDINATORS; i++) {
+                if (a.equals(coordinators[i])) {
+                    // Build peer list (all coordinators except self)
+                    Address[] peers = new Address[RAFT_NUM_COORDINATORS - 1];
+                    int idx = 0;
+                    for (int j = 0; j < RAFT_NUM_COORDINATORS; j++) {
+                        if (j != i) peers[idx++] = coordinators[j];
+                    }
+                    return new CoordinatorNode(a, regions, K, M, KEY_THRESHOLD,
+                            CLIENT_SECRETS, true, null, peers);
+                }
+            }
+            // Otherwise it's a region
+            return new RegionalNode(a);
+        });
+        // Client knows all coordinators; starts with server(1), rotates if unreachable
+        b.clientSupplier(a -> new CapstoneClient(a, coordinators, CLIENT_SECRETS.get(a.toString())));
+        b.workloadSupplier(workload);
+
+        StateGenerator sg = b.build();
+        runState = new RunState(sg);
+        for (int i = 0; i < RAFT_NUM_COORDINATORS; i++) {
+            runState.addServer(coordinators[i]);
+        }
+        for (int i = 0; i < NUM_REGIONS; i++) {
+            runState.addServer(regions[i]);
+        }
+    }
+
+    @Test(timeout = 15 * 1000)
+    @TestDescription("Raft: leader elected, write and read succeed")
+    @Category(RunTests.class)
+    @TestPointValue(10)
+    public void test37RaftBasicWriteRead() throws InterruptedException {
+        setupRaftState(emptyWorkload());
+        Client client = runState.addClient(client(1));
+
+        runState.start(runSettings);
+
+        // Give time for election to complete (300-400ms deterministic timeout)
+        Thread.sleep(1000);
+
+        // Write and read through the Raft-replicated coordinator
+        sendCommandAndCheck(client, write("raft-key", "raft-value"), writeOk());
+        sendCommandAndCheck(client, read("raft-key"), readResult("raft-value"));
+    }
+
+    @Test(timeout = 30 * 1000)
+    @TestDescription("Raft: leader crashes, new leader elected, writes continue")
+    @Category(RunTests.class)
+    @TestPointValue(10)
+    public void test38RaftLeaderFailover() throws InterruptedException {
+        setupRaftState(emptyWorkload());
+        Client client = runState.addClient(client(1));
+        runState.start(runSettings);
+
+        // Wait for election
+        Thread.sleep(1500);
+
+        // Write through current leader
+        sendCommandAndCheck(client, write("key1", "before-failover"), writeOk());
+
+        // Partition server(1) away from majority.
+        // server(2) + server(3) form majority, elect new leader.
+        // Regions (server 4,5,6) remain reachable by everyone.
+        runState.stop();
+        runSettings.partition(
+                // Majority partition: server(2), server(3), all regions, client
+                server(2), server(3), server(4), server(5), server(6), client(1));
+        runState.start(runSettings);
+
+        // Wait for new election + client coordinator rotation + re-auth
+        Thread.sleep(5000);
+
+        // Write through new leader (client gets redirected if needed)
+        sendCommandAndCheck(client, write("key2", "after-failover"), writeOk());
+
+        // Both keys readable
+        sendCommandAndCheck(client, read("key1"), readResult("before-failover"));
+        sendCommandAndCheck(client, read("key2"), readResult("after-failover"));
+    }
+
+    @Test(timeout = 30 * 1000)
+    @TestDescription("Raft: client redirected from follower to leader")
+    @Category(RunTests.class)
+    @TestPointValue(10)
+    public void test39RaftClientRedirect() throws InterruptedException {
+        // Client initially connects to server(1). If server(1) is not the leader
+        // (or becomes a follower), the client should be redirected.
+        // We partition so server(1) is a follower and server(2) or server(3) is leader.
+        setupRaftState(emptyWorkload());
+
+        // Client connects to server(1)
+        Client client = runState.addClient(client(1));
+
+        // Partition server(1) into minority initially so it can't win election
+        // server(2)+server(3) form majority and elect a leader
+        runSettings.partition(
+                server(2), server(3), server(4), server(5), server(6), client(1));
+        runState.start(runSettings);
+
+        // Wait for election on majority side
+        Thread.sleep(5000);
+
+        // Heal partition so server(1) can communicate (as follower)
+        runState.stop();
+        runSettings.resetNetwork();
+        runState.start(runSettings);
+        Thread.sleep(1000);
+
+        // Client sends to server(1) (follower) → gets NotLeaderResponse → redirected
+        // → re-authenticates with leader → write succeeds
+        sendCommandAndCheck(client, write("redirect-key", "redirected"), writeOk());
+        sendCommandAndCheck(client, read("redirect-key"), readResult("redirected"));
+    }
+
+    @Test(timeout = 30 * 1000)
+    @TestDescription("Raft: partitioned leader can't make progress (no Raft majority)")
+    @Category(RunTests.class)
+    @TestPointValue(10)
+    public void test40RaftSplitBrainNoProgress() throws InterruptedException {
+        setupRaftState(emptyWorkload());
+        Client client = runState.addClient(client(1));
+        runState.start(runSettings);
+
+        // Wait for initial election
+        Thread.sleep(1500);
+
+        // Write a key first (proves system works)
+        sendCommandAndCheck(client, write("before-split", "ok"), writeOk());
+
+        // Partition: server(1) alone with client (minority).
+        // server(1) thinks it's leader but can't reach Raft majority.
+        runState.stop();
+        runSettings.partition(
+                server(1), server(4), server(5), server(6), client(1));
+        runState.start(runSettings);
+
+        // Client sends write through server(1). Server(1) can reach regions
+        // (fragments stored), but can't Raft-commit (no majority of coordinators).
+        // Write should eventually fail (Raft can't commit → write timeout on client side).
+        client.sendCommand(write("during-split", "should-fail"));
+        Thread.sleep(5000);
+
+        // Client should NOT have a result — the write can't Raft-commit
+        // (the WriteTimeoutTimer fires on region side, but Raft commit never happens)
+        // Actually: region acks arrive (regions are in the partition), tryCommitWrite
+        // creates a Raft entry, but replicateLogEntry can't get majority.
+        // The client response is deferred until Raft commit, which never happens.
+        // Client retry fires, but same result. So client has no result.
+        assertFalse("Write should not succeed without Raft majority", client.hasResult());
+    }
+
+    @Test(timeout = 30 * 1000)
+    @TestDescription("Raft: committed data readable after failover")
+    @Category(RunTests.class)
+    @TestPointValue(10)
+    public void test41RaftReadAfterFailover() throws InterruptedException {
+        setupRaftState(emptyWorkload());
+        Client client = runState.addClient(client(1));
+        runState.start(runSettings);
+
+        Thread.sleep(1500);
+
+        // Write and read (Raft-committed, replicated to majority)
+        sendCommandAndCheck(client, write("durable-key", "durable-value"), writeOk());
+        sendCommandAndCheck(client, read("durable-key"), readResult("durable-value"));
+
+        // Partition the original leader away
+        runState.stop();
+        runSettings.partition(
+                server(2), server(3), server(4), server(5), server(6), client(1));
+        runState.start(runSettings);
+
+        // Wait for new leader election
+        Thread.sleep(5000);
+
+        // Read through new leader — data was Raft-replicated, so it's available
+        sendCommandAndCheck(client, read("durable-key"), readResult("durable-value"));
+    }
+
+    @Test(timeout = 30 * 1000)
+    @TestDescription("Raft: uncommitted write on old leader not visible on new leader")
+    @Category(RunTests.class)
+    @TestPointValue(10)
+    public void test42RaftUncommittedNotVisible() throws InterruptedException {
+        setupRaftState(emptyWorkload());
+        Client client1 = runState.addClient(client(1));
+        Client client2 = runState.addClient(client(2));
+        runState.start(runSettings);
+
+        Thread.sleep(1500);
+
+        // Partition server(1) into minority WITH client1
+        // Regions stay accessible to server(1) so region acks arrive,
+        // but Raft can't commit (no majority of coordinators)
+        runState.stop();
+        runSettings.partition(
+                server(1), server(4), server(5), server(6), client(1));
+        runState.start(runSettings);
+
+        // client1 sends write through minority leader — will hang (no Raft commit)
+        client1.sendCommand(write("phantom-key", "phantom-value"));
+        Thread.sleep(1500);
+        assertFalse("Minority write should not complete", client1.hasResult());
+
+        // Heal partition, let majority side elect new leader
+        runState.stop();
+        runSettings.resetNetwork();
+        // Put client2 with majority
+        runSettings.partition(
+                server(2), server(3), server(4), server(5), server(6), client(2));
+        runState.start(runSettings);
+        Thread.sleep(5000);
+
+        // client2 reads phantom-key through new leader — should be KEY_NOT_FOUND
+        // because the write was never Raft-committed
+        client2.sendCommand(read("phantom-key"));
+        Result r = client2.getResult();
+        assertTrue(r instanceof CapstoneReadResult);
+        assertNull("Uncommitted write should not be visible", ((CapstoneReadResult) r).value());
+    }
+
+    @Test(timeout = 30 * 1000)
+    @TestDescription("Raft: dedup survives failover")
+    @Category(RunTests.class)
+    @TestPointValue(10)
+    public void test43RaftDedupAfterFailover() throws InterruptedException {
+        setupRaftState(emptyWorkload());
+        Client client = runState.addClient(client(1));
+        runState.start(runSettings);
+
+        Thread.sleep(1500);
+
+        // Write a key (Raft-committed, dedup entry replicated)
+        sendCommandAndCheck(client, write("dedup-raft-key", "value"), writeOk());
+
+        // Partition original leader away
+        runState.stop();
+        runSettings.partition(
+                server(2), server(3), server(4), server(5), server(6), client(1));
+        runState.start(runSettings);
+
+        // Wait for new election + client coordinator rotation + re-auth
+        Thread.sleep(5000);
+
+        // Overwrite the key through new leader (different value, new seqNum)
+        // This proves the new leader has both the data AND the dedup state
+        sendCommandAndCheck(client, write("dedup-raft-key", "new-value"), writeOk());
+        sendCommandAndCheck(client, read("dedup-raft-key"), readResult("new-value"));
+    }
+
+    @Test(timeout = 30 * 1000)
+    @TestDescription("Raft: multiple writes stress test through replicated coordinator")
+    @Category(RunTests.class)
+    @TestPointValue(10)
+    public void test44RaftStress() throws InterruptedException {
+        setupRaftState(emptyWorkload());
+        Client client = runState.addClient(client(1));
+        runState.start(runSettings);
+        Thread.sleep(1500);
+
+        // 10 writes through Raft — verifies log replication at moderate scale
+        int nWrites = 10;
+        for (int i = 0; i < nWrites; i++) {
+            sendCommandAndCheck(client, write("stress-" + i, "val-" + i), writeOk());
+        }
+
+        // Read all back
+        for (int i = 0; i < nWrites; i++) {
+            sendCommandAndCheck(client, read("stress-" + i), readResult("val-" + i));
+        }
+    }
+
+    // DFS search test previously discovered a timing interaction between
+    // WriteTimeoutTimer and Raft commit. Fixed: added RaftCommitTimeoutTimer
+    // (500ms) for the Raft phase. Client ignores RAFT_COMMIT_TIMEOUT as transient.
+
+    @Test
+    @TestDescription("Search: Raft safety — DFS explores deep execution paths with 3 coordinators")
+    @Category(SearchTests.class)
+    @TestPointValue(20)
+    public void test45SearchRaftSafety() {
+        // 3 coordinators + 2 regions (minimal), single write.
+        // DFS explores deep paths checking RESULTS_OK invariant.
+        // Timers enabled so elections can happen.
+        Address[] coordinators = new Address[RAFT_NUM_COORDINATORS];
+        for (int i = 0; i < RAFT_NUM_COORDINATORS; i++) {
+            coordinators[i] = server(i + 1);
+        }
+        Address[] regions = new Address[SEARCH_NUM_REGIONS];
+        for (int i = 0; i < SEARCH_NUM_REGIONS; i++) {
+            regions[i] = server(RAFT_NUM_COORDINATORS + i + 1);
+        }
+
+        StateGeneratorBuilder b = StateGenerator.builder();
+        b.serverSupplier(a -> {
+            for (int i = 0; i < RAFT_NUM_COORDINATORS; i++) {
+                if (a.equals(coordinators[i])) {
+                    Address[] peers = new Address[RAFT_NUM_COORDINATORS - 1];
+                    int idx = 0;
+                    for (int j = 0; j < RAFT_NUM_COORDINATORS; j++) {
+                        if (j != i) peers[idx++] = coordinators[j];
+                    }
+                    return new CoordinatorNode(a, regions, SEARCH_K, SEARCH_M,
+                            SEARCH_KEY_THRESHOLD, CLIENT_SECRETS, false, null, peers);
+                }
+            }
+            return new RegionalNode(a);
+        });
+        b.clientSupplier(a -> new CapstoneClient(a, coordinators, CLIENT_SECRETS.get(a.toString())));
+        b.workloadSupplier(Workload.builder()
+                .commands(write("key", "value"))
+                .results(writeOk())
+                .build());
+
+        SearchState searchState = new SearchState(b.build());
+        for (int i = 0; i < RAFT_NUM_COORDINATORS; i++) {
+            searchState.addServer(coordinators[i]);
+        }
+        for (int i = 0; i < SEARCH_NUM_REGIONS; i++) {
+            searchState.addServer(regions[i]);
+        }
+        searchState.addClientWorker(client(1));
+
+        // DFS with depth limit — explores deep paths, checks safety invariant
+        searchSettings.maxTimeSecs(30)
+                      .maxDepth(100)
+                      .addInvariant(RESULTS_OK)
+                      .addPrune(CLIENTS_DONE);
+        dfs(searchState);
+    }
+
+    // =========================================================================
+    //  Part 11 — Raft cost measurements
+    // =========================================================================
+
+    @Test(timeout = 30 * 1000)
+    @TestDescription("Raft: message overhead per operation with 3 coordinators")
+    @Category(RunTests.class)
+    @TestPointValue(10)
+    public void test46RaftMessageCount() throws InterruptedException {
+        setupRaftState(emptyWorkload());
+        Client client = runState.addClient(client(1));
+        runState.start(runSettings);
+
+        // Wait for election + auth to fully settle
+        Thread.sleep(5000);
+
+        // Snapshot message counts before operations
+        long msgsBefore = 0;
+        for (Address s : runState.serverAddresses()) {
+            msgsBefore += runState.network().numMessagesSentTo(s);
+        }
+        msgsBefore += runState.network().numMessagesSentTo(client(1));
+
+        // 5 write+read pairs through Raft
+        int nRounds = 5;
+        for (int i = 0; i < nRounds; i++) {
+            sendCommandAndCheck(client, write("raft-mc-" + i, "v-" + i), writeOk());
+            sendCommandAndCheck(client, read("raft-mc-" + i), readResult("v-" + i));
+        }
+
+        // Snapshot after
+        long msgsAfter = 0;
+        for (Address s : runState.serverAddresses()) {
+            msgsAfter += runState.network().numMessagesSentTo(s);
+        }
+        msgsAfter += runState.network().numMessagesSentTo(client(1));
+
+        long totalMessages = msgsAfter - msgsBefore;
+        double msgsPerOp = ((double) totalMessages) / (nRounds * 2);
+
+        // Expected: ~14 (regions) + ~4 (AppendEntries to 2 peers + 2 replies)
+        //         + read leadership verification (~4 more)
+        //         + Raft heartbeats in background
+        //         ≈ 22-40 per op
+        System.out.println("Raft message count: total=" + totalMessages
+            + ", per operation=" + String.format("%.1f", msgsPerOp)
+            + " (single-coordinator was 14.2)");
+
+        // Raft adds overhead but shouldn't be extreme
+        assertTrue("Msgs/op should be >= 14 (at least region traffic)",
+                   msgsPerOp >= 14);
+        assertTrue("Msgs/op should be <= 60 (bounded Raft + heartbeat overhead)",
+                   msgsPerOp <= 60);
+    }
 }

@@ -15,7 +15,7 @@ import java.util.Arrays;
  * The Vandermonde matrix V[i][j] = (i+1)^j guarantees that any k rows form an
  * invertible submatrix — the classical property that enables erasure tolerance.
  */
-public class ErasureCoder {
+public class ErasureCoder implements java.io.Serializable {
 
     private final int k;
     private final int m;

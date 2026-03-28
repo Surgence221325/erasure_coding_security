@@ -101,3 +101,10 @@ Key Output: On commit, delete old versions locally + send DeleteVersionData to r
 Decision: Fire-and-forget. Production would add periodic reconciliation. Verified via getVersionCount() — 20 overwrites → 1 version retained.
 Evidence Link: GC in CoordinatorNode (gcOldVersions, gcUncommittedVersion), tests 33-36
 Unknowns: Orphaned fragments on regions that miss delete messages. Harmless but wastes storage.
+
+Goal: Implement Raft coordinator replication
+Prompt Summary: Extensive design discussion with AI (Claude) — evaluated Paxos vs Raft, what state to replicate (state deltas not commands), strict vs relaxed reads, log compaction. Planned 10-phase iterative implementation to avoid "getting lost in the sauce." Each phase ended with a compile+test checkpoint ensuring existing 36 tests still passed.
+Key Output: Full Raft implementation: leader election (deterministic stagger), log replication (AppendEntries/RequestVote), strict read verification (leadership confirmation before serving reads), log compaction (snapshot + InstallSnapshot), auth/ownership/GC all through Raft log. 4 new bugs found and fixed during implementation.
+Decision: State deltas in Raft log (not commands — followers can't re-execute writes with different AES keys). Leader-only auth (prevents unreplicable sessions). Two-phase write timeout (region 300ms + Raft 500ms). Client knows all coordinators (round-robin on auth failure). Fixed coordinator set (no Raft membership changes).
+Evidence Link: Raft code in CoordinatorNode, LogEntry.java, StateDelta.java, Raft messages/timers, tests 37-45
+Unknowns: DFS search test (test45) found the two-phase timeout interaction (Bug 10) — fixed, but raises question of what other timing interactions exist. Deterministic election stagger may not be sufficient under adversarial scheduling. Log compaction not tested under heavy load. Coordinator set fixed at startup (joint consensus for membership changes is too complex).

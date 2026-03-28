@@ -1,5 +1,6 @@
 package dslabs.capstone;
 
+import dslabs.framework.Address;
 import dslabs.framework.Message;
 import java.util.Arrays;
 import lombok.Data;
@@ -337,4 +338,73 @@ final class JoinResult implements Message {
 final class DeleteVersionData implements Message {
     @NonNull private final String key;
     private final int             version;
+}
+
+// =============================================================================
+//  8. Raft Consensus
+// =============================================================================
+
+/** Candidate requests a vote during leader election. */
+@Data
+final class RaftRequestVote implements Message {
+    private final int     term;
+    @NonNull private final Address candidateId;
+    private final int     lastLogIndex;
+    private final int     lastLogTerm;
+}
+
+/** Response to a vote request. */
+@Data
+final class RaftRequestVoteReply implements Message {
+    private final int     term;
+    private final boolean voteGranted;
+}
+
+/** Leader sends log entries (or empty heartbeat) to followers. */
+@Data
+final class RaftAppendEntries implements Message {
+    private final int     term;
+    @NonNull private final Address leaderId;
+    private final int     prevLogIndex;
+    private final int     prevLogTerm;
+    @NonNull private final java.util.List<LogEntry> entries;
+    private final int     leaderCommit;
+}
+
+/** Follower's response to AppendEntries. */
+@Data
+final class RaftAppendEntriesReply implements Message {
+    private final int     term;
+    private final boolean success;
+    private final int     matchIndex;  // highest index replicated on this follower
+}
+
+/** Leader sends full state snapshot to a follower that's too far behind. */
+@Data
+final class RaftInstallSnapshot implements Message {
+    private final int     term;
+    @NonNull private final Address leaderId;
+    private final int     lastIncludedIndex;
+    private final int     lastIncludedTerm;
+    @NonNull private final byte[] snapshotData;
+
+    @Override public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof RaftInstallSnapshot)) return false;
+        RaftInstallSnapshot that = (RaftInstallSnapshot) o;
+        return term == that.term && lastIncludedIndex == that.lastIncludedIndex
+            && lastIncludedTerm == that.lastIncludedTerm
+            && leaderId.equals(that.leaderId)
+            && Arrays.equals(snapshotData, that.snapshotData);
+    }
+    @Override public int hashCode() {
+        return java.util.Objects.hash(term, leaderId, lastIncludedIndex,
+            lastIncludedTerm, Arrays.hashCode(snapshotData));
+    }
+}
+
+/** Follower tells client to redirect to the leader. */
+@Data
+final class NotLeaderResponse implements Message {
+    private final Address leaderAddress;  // null if leader unknown
 }
